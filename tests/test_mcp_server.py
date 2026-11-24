@@ -149,6 +149,23 @@ class MCPServerTests(unittest.TestCase):
                 self.assertEqual(len(relay_events), 2)
                 self.assertFalse(relay_events[0]["final"])
                 self.assertTrue(relay_events[1]["final"])
+
+                # Active bridge turn with missing TELEGRAM_AGY_CHAT_ID must fail closed
+                unpinned_server = TelegramMCPServer(
+                    state_dir=state_dir,
+                    client=mock_client,
+                    env={"TELEGRAM_AGY_TURN_ID": "turn-no-chat"},
+                )
+                err_resp = unpinned_server.handle_jsonrpc(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 99,
+                        "method": "tools/call",
+                        "params": {"name": "telegram_reply", "arguments": {"chat_id": "42", "text": "hi"}},
+                    }
+                )
+                self.assertTrue(err_resp["result"]["isError"])
+                self.assertIn("Missing TELEGRAM_AGY_CHAT_ID", err_resp["result"]["content"][0]["text"])
             finally:
                 relay.stop()
 

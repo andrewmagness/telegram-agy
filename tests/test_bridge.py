@@ -80,11 +80,22 @@ class BridgeTests(unittest.TestCase):
             save_access_config(state_dir, cfg)
 
             client.reset_mock()
+            access_path = state_dir / "access.json"
+            mtime_before = access_path.stat().st_mtime_ns
             bridge.handle_message({**dm, "message_id": 2, "text": "run unit tests"}, async_turn=False)
+            # Normal message must not rewrite access.json
+            self.assertEqual(access_path.stat().st_mtime_ns, mtime_before)
             runner.run_turn.assert_called_once()
             self.assertIn("run unit tests", runner.run_turn.call_args.args[1])
             client.send_markdown.assert_called_once()
             self.assertEqual(client.send_markdown.call_args.args[1], "Tests pass!")
+
+            # Bad config ValueError inside run_turn replies with error instead of failing silently
+            client.reset_mock()
+            runner.run_turn.side_effect = ValueError("Invalid agy mode: 'bogus'")
+            bridge.handle_message({**dm, "message_id": 3, "text": "hello"}, async_turn=False)
+            client.send_markdown.assert_called_once()
+            self.assertIn("Invalid agy mode", client.send_markdown.call_args.args[1])
 
             sessions = load_sessions(state_dir)
             self.assertEqual(sessions["42"]["conversationId"], "conv-abc")
@@ -246,7 +257,8 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(res_same["decision"], "allow")
             client.send_message.assert_not_called()
 
-            # Oversized args attach full file rather than truncating silently
+            # Oversized args attach full file rather than truncating silently;
+            # Group chats omit Always (session) for ALL tools (including write_file)
             big_payload = "x" * 5000
             client.reset_mock()
 
@@ -257,8 +269,8 @@ class BridgeTests(unittest.TestCase):
                         "chatId": "42",
                         "userId": "99",
                         "chatType": "group",
-                        "toolName": "run_command",
-                        "args": {"CommandLine": big_payload},
+                        "toolName": "write_file",
+                        "args": {"Content": big_payload},
                     }
                 )
 
@@ -270,7 +282,7 @@ class BridgeTests(unittest.TestCase):
                 threading.Event().wait(0.02)
 
             client.send_file.assert_called_once()
-            # Group run_command must NOT include Always (session) button
+            # Group chats must NOT include Always (session) button
             kb = client.send_message.call_args.kwargs["reply_markup"]["inline_keyboard"][0]
             self.assertEqual([b["text"] for b in kb], ["✅ Approve", "❌ Deny"])
 

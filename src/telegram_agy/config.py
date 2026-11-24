@@ -22,7 +22,6 @@ DEFAULT_SAFE_TOOLS = [
     "list_dir",
     "find_by_name",
     "grep_search",
-    "search_web",
     "update_focus",
     "update_steps",
     "list_resources",
@@ -208,12 +207,15 @@ def save_access_config(state_dir: Path, config: dict[str, Any]) -> Path:
 def update_access_config(
     state_dir: Path,
     mutator: Callable[[dict[str, Any]], _T],
+    *,
+    should_save: Callable[[_T], bool] | None = None,
 ) -> tuple[dict[str, Any], _T]:
-    """Read, mutate, and atomically write access.json under state_lock."""
+    """Read, mutate, and optionally atomically write access.json under state_lock."""
     with state_lock(state_dir):
         cfg = load_access_config(state_dir)
         result = mutator(cfg)
-        save_access_config(state_dir, cfg)
+        if should_save is None or should_save(result):
+            save_access_config(state_dir, cfg)
         return cfg, result
 
 

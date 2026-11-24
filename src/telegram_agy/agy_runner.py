@@ -180,25 +180,33 @@ def parse_stream_json_lines(lines: Iterable[str]) -> tuple[str, str | None, str 
     return text, conversation_id, error_msg
 
 
-def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
-    """Signal the entire process group started with `start_new_session=True`."""
+def _signal_process_group(proc: subprocess.Popen[str], sig: int) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(proc.pid, sig)
     except OSError:
         try:
-            proc.terminate()
-        except OSError:
-            return
-    try:
-        proc.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            try:
+            if sig == signal.SIGKILL:
                 proc.kill()
-            except OSError:
-                pass
+            else:
+                proc.terminate()
+        except OSError:
+            pass
+
+
+def _terminate_process_group(proc: subprocess.Popen[str], *, wait_for_kill: bool = True) -> None:
+    """Signal the entire process group started with `start_new_session=True`."""
+    _signal_process_group(proc, signal.SIGTERM)
+
+    def _escalate() -> None:
+        try:
+            proc.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            _signal_process_group(proc, signal.SIGKILL)
+
+    if wait_for_kill:
+        _escalate()
+    else:
+        threading.Thread(target=_escalate, daemon=True).start()
 
 
 class AgyRunner:
@@ -225,13 +233,13 @@ class AgyRunner:
             return proc is not None and proc.poll() is None
 
     def cancel(self, session_key: str) -> bool:
-        """Terminate an in-progress turn and its child processes. Returns True if signalled."""
+        """Terminate an in-progress turn asynchronously. Returns True if signalled."""
         with self._meta_lock:
             proc = self._active_procs.get(session_key)
             if proc is None or proc.poll() is not None:
                 return False
             self._cancelled_sessions.add(session_key)
-        _terminate_process_group(proc)
+        _terminate_process_group(proc, wait_for_kill=False)
         return True
 
     def run_turn(
@@ -282,13 +290,28 @@ class AgyRunner:
                 self._cancelled_sessions.discard(session_key)
 
             timed_out = False
+            stdout_data = ""
+            stderr_data = ""
             try:
                 try:
                     stdout_data, stderr_data = proc.communicate(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     timed_out = True
-                    _terminate_process_group(proc)
-                    stdout_data, stderr_data = proc.communicate()
+                    _terminate_process_group(proc, wait_for_kill=True)
+                    try:
+                        stdout_data, stderr_data = proc.communicate(timeout=5.0)
+                    except subprocess.TimeoutExpired:
+                        for stream in (proc.stdout, proc.stderr):
+                            if stream is not None:
+                                try:
+                                    stream.close()
+                                except OSError:
+                                    pass
+                        _signal_process_group(proc, signal.SIGKILL)
+                        try:
+                            proc.wait(timeout=1.0)
+                        except subprocess.TimeoutExpired:
+                            pass
             finally:
                 with self._meta_lock:
                     self._active_procs.pop(session_key, None)
@@ -298,7 +321,7 @@ class AgyRunner:
             text, new_conv_id, err_msg = parse_stream_json_lines(stdout_data.splitlines())
             if timed_out:
                 err_msg = f"agy turn timed out after {int(turn_timeout)}s"
-            elif proc.returncode != 0 and not err_msg:
+            elif proc.returncode not in (0, None) and not err_msg:
                 stderr_clean = stderr_data.strip()
                 err_msg = stderr_clean or f"agy exited with status {proc.returncode}"
 
@@ -306,7 +329,7 @@ class AgyRunner:
                 text=text,
                 conversation_id=new_conv_id or conversation_id,
                 error=err_msg,
-                returncode=124 if timed_out else proc.returncode,
+                returncode=124 if timed_out else (proc.returncode if proc.returncode is not None else 1),
                 cancelled=was_cancelled,
                 timed_out=timed_out,
             )

@@ -137,6 +137,14 @@ class TelegramMCPServer:
     def _require_authorized_chat(self, chat_id: str | int) -> None:
         chat_str = str(chat_id).strip()
         pinned_chat = self.environ.get("TELEGRAM_AGY_CHAT_ID", "").strip()
+        in_bridge_turn = bool(
+            self.environ.get("TELEGRAM_AGY_TURN_ID", "").strip()
+            or self.environ.get("TELEGRAM_AGY_RELAY_SOCK", "").strip()
+        )
+        if in_bridge_turn and not pinned_chat:
+            raise PermissionError(
+                "Missing TELEGRAM_AGY_CHAT_ID during an active bridge turn."
+            )
         if pinned_chat and chat_str != pinned_chat:
             raise PermissionError(
                 f"Chat {chat_str} does not match active turn chat {pinned_chat}."

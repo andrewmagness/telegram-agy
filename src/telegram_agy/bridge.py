@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .access import evaluate_inbound_message, is_authorized_callback_user
-from .agy_runner import VALID_MODES, AgyRunner
+from .agy_runner import VALID_MODES, AgyResult, AgyRunner
 from .config import (
     get_inbox_dir,
     load_access_config,
@@ -251,7 +251,7 @@ class TelegramBridge:
         )
 
         is_group = chat_type in ("group", "supergroup")
-        allow_session_btn = not (is_group and tool_name == "run_command")
+        allow_session_btn = not is_group
         keyboard = self._build_approval_keyboard(req_id, allow_session=allow_session_btn)
 
         approval = PendingApproval(
@@ -604,7 +604,11 @@ class TelegramBridge:
                     bot_username=self._bot_username,
                 )
 
-            access_cfg, decision = update_access_config(self.state_dir, _eval)
+            access_cfg, decision = update_access_config(
+                self.state_dir,
+                _eval,
+                should_save=lambda d: d.config_changed,
+            )
 
         if decision.reply_text and chat_id is not None:
             try:
@@ -716,15 +720,19 @@ class TelegramBridge:
         }
 
         try:
-            result = self.runner.run_turn(
-                session_key,
-                envelope,
-                cwd=cwd,
-                conversation_id=conv_id,
-                execution_cfg=exec_cfg,
-                session_cfg=sess_cfg,
-                extra_env=extra_env,
-            )
+            try:
+                result = self.runner.run_turn(
+                    session_key,
+                    envelope,
+                    cwd=cwd,
+                    conversation_id=conv_id,
+                    execution_cfg=exec_cfg,
+                    session_cfg=sess_cfg,
+                    extra_env=extra_env,
+                )
+            except Exception as exc:
+                LOGGER.exception("Failed running agy turn: %s", exc)
+                result = AgyResult(text="", error=str(exc), returncode=1)
         finally:
             typing_stop.set()
             typing_thread.join(timeout=1.0)

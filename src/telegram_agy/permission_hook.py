@@ -12,7 +12,36 @@ from typing import Any, TextIO
 from .config import DEFAULT_SAFE_TOOLS, get_state_dir, load_access_config
 from .relay import send_relay_request
 
-_PATH_ARG_KEYS = {"path", "file_path", "targetfile", "destination", "target", "file"}
+_PATH_ARG_KEYS = {
+    "path",
+    "file_path",
+    "targetfile",
+    "destination",
+    "target",
+    "file",
+    "absolutepath",
+    "directorypath",
+    "searchpath",
+    "searchdirectory",
+    "directory",
+    "dir",
+}
+_READ_TOOLS = {
+    "read_file",
+    "view_file",
+    "view_file_outline",
+    "view_code_item",
+    "list_dir",
+    "find_by_name",
+    "grep_search",
+}
+_TELEGRAM_MCP_PREFIXES = (
+    "mcp_telegram-agy_",
+    "mcp_telegram_agy_",
+    "telegram-agy_",
+    "telegram-agy_telegram-agy_",
+    "telegram_agy_",
+)
 
 
 def _iter_string_items(value: Any, *, key_hint: str = "") -> list[tuple[str, str]]:
@@ -38,6 +67,8 @@ def _targets_state_dir(args: Any, state_dir: Path, *, cwd: str = "") -> bool:
         str(state_dir),
         "~/.gemini/channels/telegram",
         ".gemini/channels/telegram",
+        "$TELEGRAM_AGY_STATE_DIR",
+        "${TELEGRAM_AGY_STATE_DIR}",
     }
 
     for key, text in _iter_string_items(args):
@@ -60,11 +91,56 @@ def _targets_state_dir(args: Any, state_dir: Path, *, cwd: str = "") -> bool:
         for marker in state_markers:
             if marker in raw:
                 inbox_marker = f"{marker.rstrip('/')}/inbox"
-                # If every occurrence points into inbox/, allow it; otherwise block.
                 stripped = raw.replace(inbox_marker, "")
                 if marker in stripped:
                     return True
     return False
+
+
+def _read_targets_within_allowed_roots(
+    args: Any,
+    *,
+    workspace_cwd: str,
+    inbox_dir: Path,
+    fallback_cwd: str,
+) -> bool:
+    """Return True if all path-like arguments in *args* stay within workspace or inbox."""
+    allowed_roots = [inbox_dir.expanduser().resolve()]
+    if workspace_cwd:
+        allowed_roots.append(Path(workspace_cwd).expanduser().resolve())
+    elif fallback_cwd:
+        allowed_roots.append(Path(fallback_cwd).expanduser().resolve())
+
+    base_cwd = (
+        Path(workspace_cwd or fallback_cwd).expanduser().resolve()
+        if (workspace_cwd or fallback_cwd)
+        else Path.cwd().resolve()
+    )
+
+    for key, text in _iter_string_items(args):
+        key_l = key.lower()
+        is_path_key = key_l in _PATH_ARG_KEYS or any(
+            tok in key_l for tok in ("path", "dir", "file")
+        )
+        raw = text.strip()
+        if not is_path_key or not raw:
+            continue
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = base_cwd / candidate
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            return False
+        if not any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots):
+            return False
+    return True
+
+
+def _matches_telegram_tool(tool_name: str, base_name: str) -> bool:
+    if tool_name == base_name:
+        return True
+    return any(tool_name == f"{prefix}{base_name}" for prefix in _TELEGRAM_MCP_PREFIXES)
 
 
 def _is_safe_tool(tool_name: str, safe_tools: set[str]) -> bool:
@@ -73,7 +149,7 @@ def _is_safe_tool(tool_name: str, safe_tools: set[str]) -> bool:
     if tool_name in safe_tools:
         return True
     for entry in safe_tools:
-        if entry.startswith("telegram_") and tool_name.endswith(f"_{entry}"):
+        if entry.startswith("telegram_") and _matches_telegram_tool(tool_name, entry):
             return True
     return False
 
@@ -88,8 +164,9 @@ def evaluate_hook_payload(
     environ = os.environ if env is None else env
     relay_sock = environ.get("TELEGRAM_AGY_RELAY_SOCK", "").strip()
     if not relay_sock:
-        # Normal interactive agy session outside the Telegram bridge:
-        # delegate to Antigravity's built-in hooks/policies.
+        # Per Antigravity's PreToolUse contract (https://antigravity.google/docs/hooks):
+        # "allow" delegates to the next hook / Antigravity's default permission policy,
+        # whereas "auto_approve" bypasses interactive prompts and {} is rejected as deny.
         return {"decision": "allow"}
 
     resolved_state = state_dir or get_state_dir(
@@ -104,26 +181,37 @@ def evaluate_hook_payload(
     args = tool_call.get("args") or {}
     cwd = str(payload.get("cwd") or "")
 
-    is_telegram_reply = tool_name == "telegram_reply" or tool_name.endswith("_telegram_reply")
-    is_safe = _is_safe_tool(tool_name, safe_tools)
-
-    # Never allow mutating or shell tools to tamper with telegram-agy state/credentials.
-    if not is_safe and _targets_state_dir(args, resolved_state, cwd=cwd):
+    # Block any tool (including read tools) from accessing state_dir outside inbox/.
+    if _targets_state_dir(args, resolved_state, cwd=cwd):
         return {
             "decision": "deny",
-            "reason": "Modifying telegram-agy state directory is prohibited.",
+            "reason": "Accessing telegram-agy state directory is prohibited.",
         }
 
     perm_mode = environ.get("TELEGRAM_AGY_PERMISSION_MODE", "relay").strip()
     if perm_mode in ("sandbox-auto", "full-auto"):
         return {"decision": "auto_approve"}
 
+    is_telegram_reply = _matches_telegram_tool(tool_name, "telegram_reply")
+    is_safe = _is_safe_tool(tool_name, safe_tools)
+
     if is_telegram_reply:
         files = args.get("files") if isinstance(args, dict) else None
         if not files:
             return {"decision": "auto_approve"}
     elif is_safe:
-        return {"decision": "auto_approve"}
+        if tool_name in _READ_TOOLS:
+            workspace_cwd = environ.get("TELEGRAM_AGY_CWD", "").strip()
+            inbox_dir = resolved_state / "inbox"
+            if _read_targets_within_allowed_roots(
+                args,
+                workspace_cwd=workspace_cwd,
+                inbox_dir=inbox_dir,
+                fallback_cwd=cwd,
+            ):
+                return {"decision": "auto_approve"}
+        else:
+            return {"decision": "auto_approve"}
 
     chat_id = environ.get("TELEGRAM_AGY_CHAT_ID", "")
     thread_id = environ.get("TELEGRAM_AGY_THREAD_ID", "")

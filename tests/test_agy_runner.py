@@ -110,14 +110,15 @@ class AgyRunnerTests(unittest.TestCase):
             self.assertEqual(res.returncode, 124)
             self.assertIn("timed out", res.error or "")
 
-    def test_runner_cancel_terminates_active_turn(self) -> None:
+    def test_runner_cancel_is_non_blocking_even_when_sigterm_ignored(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-            fake_agy = Path(tmpdir) / "slow_agy.py"
+            fake_agy = Path(tmpdir) / "stubborn_agy.py"
             fake_agy.write_text(
                 "\n".join(
                     [
                         f"#!{sys.executable}",
-                        "import time",
+                        "import signal, time",
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
                         "time.sleep(30)",
                     ]
                 )
@@ -138,7 +139,10 @@ class AgyRunnerTests(unittest.TestCase):
                 if runner.is_running("42"):
                     break
                 time.sleep(0.02)
+            t0 = time.monotonic()
             self.assertTrue(runner.cancel("42"))
+            elapsed = time.monotonic() - t0
+            self.assertLess(elapsed, 0.5)
             t.join(timeout=5.0)
             self.assertTrue(holder["res"].cancelled)
 

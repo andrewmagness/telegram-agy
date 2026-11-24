@@ -49,6 +49,8 @@ Run `telegram-agy access ...` (or `PYTHONPATH="${PLUGIN_ROOT:-.}/src" python3 -m
   telegram-agy access set sandbox true                  # true | false
   telegram-agy access set defaultCwd /path/to/project
   telegram-agy access set allowedRoots /path/one,/path/two
+  telegram-agy access set safeTools read_file,list_dir,grep_search
+  telegram-agy access set extraArgs ""
   telegram-agy access set model ""
   telegram-agy access set mode auto                     # auto | accept-edits | plan
   telegram-agy access set ackReaction 👀

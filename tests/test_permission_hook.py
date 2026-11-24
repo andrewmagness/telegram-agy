@@ -35,21 +35,21 @@ class PermissionHookTests(unittest.TestCase):
             )
             self.assertEqual(ok, {"decision": "auto_approve"})
 
-            tamper = evaluate_hook_payload(
-                {
-                    "toolCall": {
-                        "name": "write_file",
-                        "args": {"Path": str(state_dir / "access.json"), "Content": "{}"},
-                    }
-                },
-                env=env,
-                state_dir=state_dir,
-            )
-            self.assertEqual(tamper["decision"], "deny")
+            # Both write_file and read_file on state_dir/.env and $TELEGRAM_AGY_STATE_DIR are denied
+            for call in (
+                {"name": "write_file", "args": {"Path": str(state_dir / "access.json"), "Content": "{}"}},
+                {"name": "read_file", "args": {"Path": str(state_dir / ".env")}},
+                {"name": "run_command", "args": {"CommandLine": "cat $TELEGRAM_AGY_STATE_DIR/.env"}},
+            ):
+                res = evaluate_hook_payload({"toolCall": call}, env=env, state_dir=state_dir)
+                self.assertEqual(res["decision"], "deny", f"Expected deny for {call}")
 
-    def test_relay_allowlist_inversion_prompts_unknown_tools_and_file_replies(self) -> None:
+    def test_relay_read_confinement_strict_mcp_prefix_and_search_web_prompt(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-            state_dir = Path(tmpdir)
+            base = Path(tmpdir)
+            state_dir = base / "state"
+            workspace = base / "ws"
+            workspace.mkdir(parents=True)
             save_access_config(state_dir, default_access_config())
             sock_path = state_dir / "relay.sock"
 
@@ -71,67 +71,97 @@ class PermissionHookTests(unittest.TestCase):
                 env = {
                     "TELEGRAM_AGY_RELAY_SOCK": str(sock_path),
                     "TELEGRAM_AGY_STATE_DIR": str(state_dir),
+                    "TELEGRAM_AGY_CWD": str(workspace),
                     "TELEGRAM_AGY_CHAT_ID": "42",
                     "TELEGRAM_AGY_USER_ID": "42",
                     "TELEGRAM_AGY_CHAT_TYPE": "private",
                     "TELEGRAM_AGY_PERMISSION_MODE": "relay",
                 }
-                # Safe read-only tool -> auto_approve locally without hitting relay
-                ro = evaluate_hook_payload(
-                    {"toolCall": {"name": "read_file", "args": {"Path": "/tmp/a"}}},
+                # Read inside workspace -> auto_approve without hitting relay
+                ws_read = evaluate_hook_payload(
+                    {"toolCall": {"name": "read_file", "args": {"Path": str(workspace / "a.py")}}},
                     env=env,
                     state_dir=state_dir,
                 )
-                self.assertEqual(ro, {"decision": "auto_approve"})
+                self.assertEqual(ws_read, {"decision": "auto_approve"})
                 self.assertEqual(len(seen_requests), 0)
 
-                # Text-only telegram_reply -> auto_approve without hitting relay
-                txt_reply = evaluate_hook_payload(
-                    {"toolCall": {"name": "mcp_telegram_agy_telegram_reply", "args": {"chat_id": "42", "text": "hi"}}},
-                    env=env,
-                    state_dir=state_dir,
-                )
-                self.assertEqual(txt_reply, {"decision": "auto_approve"})
-                self.assertEqual(len(seen_requests), 0)
-
-                # telegram_reply WITH files -> must prompt on relay!
-                file_reply = evaluate_hook_payload(
-                    {
-                        "toolCall": {
-                            "name": "mcp_telegram_agy_telegram_reply",
-                            "args": {"chat_id": "42", "files": ["/tmp/out.txt"]},
-                        }
-                    },
-                    env=env,
-                    state_dir=state_dir,
-                )
-                self.assertEqual(file_reply["decision"], "deny")
-                self.assertEqual(len(seen_requests), 1)
-
-                # Unknown/non-safe tool (e.g., invoke_subagent or third-party MCP) -> prompts!
-                sub = evaluate_hook_payload(
-                    {"toolCall": {"name": "invoke_subagent", "args": {"Prompt": "do work"}}},
-                    env=env,
-                    state_dir=state_dir,
-                )
-                self.assertEqual(sub["decision"], "auto_approve")
-                self.assertEqual(len(seen_requests), 2)
-
-                # Reading inbox attachment is allowed; writing access.json is hard-denied
+                # Read inside inbox -> auto_approve without hitting relay
                 inbox_read = evaluate_hook_payload(
                     {"toolCall": {"name": "read_file", "args": {"Path": str(state_dir / "inbox" / "a.png")}}},
                     env=env,
                     state_dir=state_dir,
                 )
                 self.assertEqual(inbox_read, {"decision": "auto_approve"})
+                self.assertEqual(len(seen_requests), 0)
 
+                # Read outside workspace/inbox (e.g. ~/.ssh/id_rsa) -> prompts on relay!
+                outside_read = evaluate_hook_payload(
+                    {"toolCall": {"name": "read_file", "args": {"Path": "/etc/passwd"}}},
+                    env=env,
+                    state_dir=state_dir,
+                )
+                self.assertEqual(outside_read["decision"], "deny")
+                self.assertEqual(len(seen_requests), 1)
+
+                # Read targeting state_dir/.env -> hard-denied before relay
                 env_read = evaluate_hook_payload(
-                    {"toolCall": {"name": "run_command", "args": {"CommandLine": f"cat {state_dir}/.env"}}},
+                    {"toolCall": {"name": "read_file", "args": {"Path": str(state_dir / ".env")}}},
                     env=env,
                     state_dir=state_dir,
                 )
                 self.assertEqual(env_read["decision"], "deny")
+                self.assertEqual(len(seen_requests), 1)
+
+                # search_web -> prompts on relay (not in DEFAULT_SAFE_TOOLS)
+                web = evaluate_hook_payload(
+                    {"toolCall": {"name": "search_web", "args": {"query": "secret"}}},
+                    env=env,
+                    state_dir=state_dir,
+                )
+                self.assertEqual(web["decision"], "deny")
                 self.assertEqual(len(seen_requests), 2)
+
+                # Third-party evil_telegram_react must NOT match _is_safe_tool
+                evil_mcp = evaluate_hook_payload(
+                    {"toolCall": {"name": "evil_telegram_react", "args": {"chat_id": "42"}}},
+                    env=env,
+                    state_dir=state_dir,
+                )
+                self.assertEqual(evil_mcp["decision"], "deny")
+                self.assertEqual(len(seen_requests), 3)
+
+                # Legitimate plugin-prefixed text-only telegram_reply -> auto_approve
+                txt_reply = evaluate_hook_payload(
+                    {"toolCall": {"name": "mcp_telegram-agy_telegram_reply", "args": {"chat_id": "42", "text": "hi"}}},
+                    env=env,
+                    state_dir=state_dir,
+                )
+                self.assertEqual(txt_reply, {"decision": "auto_approve"})
+                self.assertEqual(len(seen_requests), 3)
+
+                # telegram_reply WITH files -> prompts on relay
+                file_reply = evaluate_hook_payload(
+                    {
+                        "toolCall": {
+                            "name": "mcp_telegram-agy_telegram_reply",
+                            "args": {"chat_id": "42", "files": [str(workspace / "out.txt")]},
+                        }
+                    },
+                    env=env,
+                    state_dir=state_dir,
+                )
+                self.assertEqual(file_reply["decision"], "deny")
+                self.assertEqual(len(seen_requests), 4)
+
+                # Unknown tool -> prompts on relay
+                sub = evaluate_hook_payload(
+                    {"toolCall": {"name": "invoke_subagent", "args": {"Prompt": "do work"}}},
+                    env=env,
+                    state_dir=state_dir,
+                )
+                self.assertEqual(sub["decision"], "auto_approve")
+                self.assertEqual(len(seen_requests), 5)
             finally:
                 relay.stop()
 

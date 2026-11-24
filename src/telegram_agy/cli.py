@@ -29,6 +29,7 @@ from .access import (
 from .agy_runner import VALID_MODES
 from .bridge import TelegramBridge
 from .config import (
+    DEFAULT_SAFE_TOOLS,
     get_state_dir,
     load_access_config,
     load_bot_token,
@@ -49,14 +50,29 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 def _pid_matches_telegram_agy(pid: int) -> bool:
-    cmdline_path = Path(f"/proc/{pid}/cmdline")
-    if not cmdline_path.exists():
-        return True
+    proc_dir = Path("/proc")
+    if proc_dir.is_dir():
+        cmdline_path = proc_dir / str(pid) / "cmdline"
+        try:
+            raw = cmdline_path.read_bytes().decode("utf-8", errors="replace")
+        except OSError:
+            return False
+        return "telegram_agy" in raw or "telegram-agy" in raw
+
+    # Non-Linux fallback (e.g., macOS/BSD): query ps and fail safe if unconfirmed.
     try:
-        raw = cmdline_path.read_bytes().decode("utf-8", errors="replace")
+        res = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+            check=False,
+        )
     except OSError:
         return False
-    return "telegram_agy" in raw or "telegram-agy" in raw
+    if res.returncode != 0:
+        return False
+    return "telegram_agy" in res.stdout or "telegram-agy" in res.stdout
 
 
 def _bridge_lock_held(state_dir: Path) -> bool:
@@ -172,47 +188,71 @@ def _cmd_access(args: argparse.Namespace) -> int:
         return 0
 
     if sub == "allow":
-        _, added = update_access_config(state_dir, lambda cfg: allow_user(cfg, args.user_id))
+        try:
+            _, added = update_access_config(state_dir, lambda cfg: allow_user(cfg, args.user_id))
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         print("User added to allowFrom." if added else "User already in allowFrom.")
         return 0
 
     if sub == "remove":
-        _, removed = update_access_config(state_dir, lambda cfg: remove_user(cfg, args.user_id))
+        try:
+            _, removed = update_access_config(state_dir, lambda cfg: remove_user(cfg, args.user_id))
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         print("User removed from allowFrom." if removed else "User was not in allowFrom.")
         return 0
 
     if sub == "policy":
-        cfg, _ = update_access_config(state_dir, lambda c: set_dm_policy(c, args.policy))
+        try:
+            cfg, _ = update_access_config(state_dir, lambda c: set_dm_policy(c, args.policy))
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
         print(f"dmPolicy set to {cfg['dmPolicy']}.")
         return 0
 
     if sub == "group":
         gsub = args.group_cmd
         if gsub == "add":
-            update_access_config(
-                state_dir,
-                lambda c: add_group(
-                    c,
-                    args.chat_id,
-                    require_mention=not args.no_mention,
-                    allow_all_members=bool(args.allow_all),
-                ),
-            )
+            try:
+                update_access_config(
+                    state_dir,
+                    lambda c: add_group(
+                        c,
+                        args.chat_id,
+                        require_mention=not args.no_mention,
+                        allow_all_members=bool(args.allow_all),
+                    ),
+                )
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
             print(
                 f"Group {args.chat_id} added "
                 f"(requireMention={not args.no_mention}, allowAllMembers={bool(args.allow_all)})."
             )
             return 0
         if gsub == "remove":
-            _, removed = update_access_config(
-                state_dir, lambda c: remove_group(c, args.chat_id)
-            )
+            try:
+                _, removed = update_access_config(
+                    state_dir, lambda c: remove_group(c, args.chat_id)
+                )
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
             print(f"Group {args.chat_id} removed." if removed else f"Group {args.chat_id} not found.")
             return 0
         if gsub == "allow":
-            _, added = update_access_config(
-                state_dir, lambda c: allow_group_user(c, args.chat_id, args.user_id)
-            )
+            try:
+                _, added = update_access_config(
+                    state_dir, lambda c: allow_group_user(c, args.chat_id, args.user_id)
+                )
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 1
             print(
                 f"User {args.user_id} added to group {args.chat_id}."
                 if added
@@ -261,6 +301,11 @@ def _cmd_access(args: argparse.Namespace) -> int:
                     if p.strip()
                 ]
                 exec_cfg[key] = roots
+            elif key == "safeTools":
+                tools = [t.strip() for t in raw_val.split(",") if t.strip()]
+                exec_cfg[key] = tools if tools else list(DEFAULT_SAFE_TOOLS)
+            elif key == "extraArgs":
+                exec_cfg[key] = [a.strip() for a in raw_val.split(",") if a.strip()]
             elif key == "textChunkLimit":
                 val = int(raw_val)
                 if not 64 <= val <= 4096:
@@ -413,6 +458,11 @@ def _cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _systemd_quote(val: str) -> str:
+    escaped = val.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return f'"{escaped}"'
+
+
 def _cmd_systemd(args: argparse.Namespace) -> int:
     state_dir = get_state_dir(args.state_dir)
     cfg = load_access_config(state_dir)
@@ -420,20 +470,25 @@ def _cmd_systemd(args: argparse.Namespace) -> int:
     cwd = str(Path(raw_cwd).expanduser().resolve())
     exe = shutil.which("telegram-agy")
     src_dir = str(Path(__file__).resolve().parent.parent)
-    exec_start = (
-        f"{exe} --state-dir {state_dir} run --cwd {cwd}"
-        if exe
-        else f"{sys.executable} -m telegram_agy --state-dir {state_dir} run --cwd {cwd}"
-    )
+    q_state = _systemd_quote(str(state_dir))
+    q_cwd = _systemd_quote(cwd)
+    q_src = _systemd_quote(src_dir)
+    if exe:
+        exec_start = f"{_systemd_quote(exe)} --state-dir {q_state} run --cwd {q_cwd}"
+    else:
+        exec_start = (
+            f"{_systemd_quote(sys.executable)} -m telegram_agy "
+            f"--state-dir {q_state} run --cwd {q_cwd}"
+        )
     unit = f"""[Unit]
 Description=Telegram Channel Bridge for Antigravity CLI (agy)
 After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory={cwd}
-Environment=PYTHONPATH={src_dir}
-Environment=TELEGRAM_AGY_STATE_DIR={state_dir}
+WorkingDirectory={q_cwd}
+Environment={_systemd_quote(f'PYTHONPATH={src_dir}')}
+Environment={_systemd_quote(f'TELEGRAM_AGY_STATE_DIR={state_dir}')}
 ExecStart={exec_start}
 Restart=on-failure
 RestartSec=5

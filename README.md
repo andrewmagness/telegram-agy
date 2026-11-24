@@ -95,12 +95,14 @@ Configure how `agy` handles tool execution for Telegram-originated turns via `te
 
 | Mode | Behavior |
 | :--- | :--- |
-| `relay` *(default)* | Runs `agy --sandbox`. Tools in `safeTools` (read-only built-ins + safe messaging tools) auto-approve; **everything else** (including `run_command`, file edits, subagents, unknown MCP tools, and `telegram_reply` with `files`) prompts you in Telegram with `[Approve]`, `[Always (session)]`, and `[Deny]` inline buttons. |
-| `sandbox-auto` | Runs `agy --sandbox --dangerously-skip-permissions` (auto-approves within Antigravity's sandbox; writes targeting `~/.gemini/channels/telegram/` outside `inbox/` remain blocked). |
-| `full-auto` | Runs `agy --dangerously-skip-permissions` (with `--sandbox` disabled unless set via `access set sandbox true`). |
+| `relay` *(default)* | Runs `agy --sandbox`. Read tools (`read_file`, `view_file`, `grep_search`, etc.) auto-approve **only** inside the active workspace or `inbox/`; reads outside those directories, `search_web`, `run_command`, file edits, subagents, unknown MCP tools, and `telegram_reply` with `files` prompt you in Telegram with `[Approve]` / `[Deny]` inline buttons. Access to `~/.gemini/channels/telegram/` outside `inbox/` is always denied. |
+| `sandbox-auto` | Runs `agy --sandbox --dangerously-skip-permissions` (auto-approves within Antigravity's sandbox). Hook-level string matching against `~/.gemini/channels/telegram/` acts as defense-in-depth—use Antigravity's OS sandbox as the hard boundary. |
+| `full-auto` | Runs `agy --dangerously-skip-permissions` without sandbox restrictions. Hook-level state-dir checks are only a speed bump here; use only for trusted single-owner setups. |
 
 Additional hardening knobs (`telegram-agy access set <key> <value>`):
 - `allowedRoots` — comma-separated list of directories `/cd` is confined to (empty = allow any directory for global owners)
+- `safeTools` — comma-separated list of tools allowed without prompting in `relay` mode (empty resets to defaults)
+- `extraArgs` — comma-separated extra CLI flags passed to `agy` (empty clears)
 - `approvalTimeoutSeconds` — `5..120` seconds (default `120`)
 - `turnTimeoutSeconds` — max runtime per `agy` turn in seconds (`0..86400`, default `600`)
 - `denyOversizedApprovals` — `false` (default: attach full JSON arguments above 3800 chars before the prompt) or `true` (auto-deny oversized tool arguments)
