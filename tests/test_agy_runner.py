@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from telegram_agy.agy_runner import AgyRunner, build_agy_command, parse_stream_json_lines
+from telegram_agy.agy_runner import AgyRunner, build_agy_command, parse_stream_json_lines, resolve_agy_bin
 
 
 class AgyRunnerTests(unittest.TestCase):
@@ -145,6 +145,20 @@ class AgyRunnerTests(unittest.TestCase):
             self.assertLess(elapsed, 0.5)
             t.join(timeout=5.0)
             self.assertTrue(holder["res"].cancelled)
+
+    def test_resolve_agy_bin_falls_back_to_local_bin_when_missing_from_path(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+            fake_home = Path(tmpdir)
+            local_bin = fake_home / ".local" / "bin"
+            local_bin.mkdir(parents=True)
+            agy_path = local_bin / "agy"
+            agy_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            agy_path.chmod(0o755)
+
+            with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}), patch(
+                "telegram_agy.agy_runner.shutil.which", return_value=None
+            ), patch("telegram_agy.agy_runner.Path.home", return_value=fake_home):
+                self.assertEqual(resolve_agy_bin("agy"), str(agy_path))
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import mimetypes
 import re
@@ -153,8 +154,13 @@ class TelegramClient:
             raise TelegramAPIError(method, status, desc) from exc
         except urllib.error.URLError as exc:
             raise TelegramAPIError(method, 0, str(exc.reason)) from exc
+        except (TimeoutError, OSError, http.client.HTTPException) as exc:
+            raise TelegramAPIError(method, 0, f"{type(exc).__name__}: {exc}") from exc
 
-        parsed = json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise TelegramAPIError(method, status, f"Invalid JSON response: {exc}") from exc
         if not parsed.get("ok"):
             raise TelegramAPIError(
                 method,
@@ -420,6 +426,8 @@ class TelegramClient:
             raise TelegramAPIError("downloadFile", exc.code, str(exc.reason)) from exc
         except urllib.error.URLError as exc:
             raise TelegramAPIError("downloadFile", 0, str(exc.reason)) from exc
+        except (TimeoutError, OSError, http.client.HTTPException) as exc:
+            raise TelegramAPIError("downloadFile", 0, f"{type(exc).__name__}: {exc}") from exc
 
         target.write_bytes(b"".join(chunks))
         return target

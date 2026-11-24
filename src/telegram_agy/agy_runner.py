@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -13,6 +14,26 @@ from pathlib import Path
 from typing import Any
 
 VALID_MODES = ("auto", "accept-edits", "plan")
+
+
+def resolve_agy_bin(agy_bin: str = "agy") -> str:
+    """Resolve the `agy` executable across PATH and standard Antigravity install locations."""
+    if agy_bin != "agy":
+        return agy_bin
+    found = shutil.which("agy")
+    if found:
+        return found
+    home = Path.home()
+    candidates = (
+        home / ".local" / "bin" / "agy",
+        home / ".gemini" / "antigravity" / "bin" / "agy",
+        home / ".config" / "Antigravity" / "bin" / "agy",
+        Path("/usr/local/bin/agy"),
+    )
+    for candidate in candidates:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return "agy"
 
 
 @dataclass
@@ -257,16 +278,23 @@ class AgyRunner:
         exec_cfg = execution_cfg or {}
         lock = self._get_lock(session_key)
         with lock:
+            resolved_bin = resolve_agy_bin(self.agy_bin)
             cmd = build_agy_command(
                 prompt,
                 conversation_id=conversation_id,
                 execution_cfg=exec_cfg,
                 session_cfg=session_cfg,
-                agy_bin=self.agy_bin,
+                agy_bin=resolved_bin,
             )
             env = os.environ.copy()
             # Never leak TELEGRAM_BOT_TOKEN into the agent subprocess environment.
             env.pop("TELEGRAM_BOT_TOKEN", None)
+            if os.path.isabs(resolved_bin):
+                bin_dir = str(Path(resolved_bin).parent)
+                cur_path = env.get("PATH", "")
+                path_parts = [p for p in cur_path.split(os.pathsep) if p]
+                if bin_dir not in path_parts:
+                    env["PATH"] = os.pathsep.join([bin_dir, *path_parts])
             if extra_env:
                 env.update(extra_env)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import tempfile
 import unittest
@@ -104,6 +105,44 @@ class TelegramApiTests(unittest.TestCase):
             ):
                 with self.assertRaises(ValueError):
                     client.download_file("fid_1", Path(tmpdir))
+
+    def test_transient_timeout_http_and_json_errors_wrapped_as_telegram_api_error(self) -> None:
+        client = TelegramClient("12345:secret")
+        for exc in (
+            TimeoutError("The read operation timed out"),
+            http.client.RemoteDisconnected("Remote end closed connection"),
+            ConnectionResetError("Connection reset by peer"),
+        ):
+            with patch("urllib.request.urlopen", side_effect=exc):
+                with self.assertRaises(TelegramAPIError) as ctx:
+                    client.get_updates(timeout=1)
+                self.assertEqual(ctx.exception.status, 0)
+                self.assertIn(type(exc).__name__, str(ctx.exception))
+
+        # Invalid JSON response also wrapped
+        class _BadJsonResp:
+            status = 502
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def read(self):
+                return b"<html>bad gateway</html>"
+
+        with patch("urllib.request.urlopen", return_value=_BadJsonResp()):
+            with self.assertRaises(TelegramAPIError) as ctx:
+                client.get_updates(timeout=1)
+            self.assertEqual(ctx.exception.status, 502)
+
+        # download_file wraps TimeoutError
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+            with patch.object(client, "get_file", return_value={"file_path": "docs/a.txt", "file_size": 5}):
+                with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
+                    with self.assertRaises(TelegramAPIError):
+                        client.download_file("fid_2", Path(tmpdir))
 
 
 if __name__ == "__main__":

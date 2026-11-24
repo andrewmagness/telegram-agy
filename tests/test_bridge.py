@@ -6,7 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from telegram_agy.access import add_group, allow_user, approve_pairing
 from telegram_agy.agy_runner import AgyResult
@@ -21,6 +21,7 @@ from telegram_agy.config import (
     update_access_config,
 )
 from telegram_agy.relay import send_relay_request
+from telegram_agy.telegram_api import TelegramAPIError
 
 
 class BridgeTests(unittest.TestCase):
@@ -340,6 +341,29 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 b2.run_forever()
             t1.join(timeout=3.0)
+
+    def test_run_forever_survives_transient_timeout_and_409_errors(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+            state_dir = Path(tmpdir) / "state"
+            client = MagicMock()
+            client.get_me.return_value = {"id": 1, "username": "test_bot"}
+
+            bridge = TelegramBridge(state_dir, client, default_cwd=Path(tmpdir))
+            calls = {"n": 0}
+
+            def flaky_get_updates(**_kw):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise TimeoutError("The read operation timed out")
+                if calls["n"] == 2:
+                    raise TelegramAPIError("getUpdates", 409, "Conflict: terminated by other getUpdates request")
+                bridge.stop()
+                return []
+
+            client.get_updates.side_effect = flaky_get_updates
+            with patch.object(bridge._stop_event, "wait", return_value=False):
+                bridge.run_forever()
+            self.assertEqual(calls["n"], 3)
 
 
 if __name__ == "__main__":

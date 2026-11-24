@@ -26,7 +26,7 @@ from .access import (
     remove_user,
     set_dm_policy,
 )
-from .agy_runner import VALID_MODES
+from .agy_runner import VALID_MODES, resolve_agy_bin
 from .bridge import TelegramBridge
 from .config import (
     DEFAULT_SAFE_TOOLS,
@@ -463,6 +463,28 @@ def _systemd_quote(val: str) -> str:
     return f'"{escaped}"'
 
 
+def _build_service_path() -> str:
+    home = Path.home()
+    candidates: list[str] = []
+    resolved_agy = resolve_agy_bin("agy")
+    if os.path.isabs(resolved_agy):
+        candidates.append(str(Path(resolved_agy).parent))
+    candidates.extend(
+        [
+            str(home / ".local" / "bin"),
+            str(home / ".gemini" / "antigravity" / "bin"),
+            str(home / ".config" / "Antigravity" / "bin"),
+        ]
+    )
+    candidates.extend(p for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+    candidates.extend(["/usr/local/bin", "/usr/bin", "/bin"])
+    deduped: list[str] = []
+    for entry in candidates:
+        if entry not in deduped:
+            deduped.append(entry)
+    return os.pathsep.join(deduped)
+
+
 def _cmd_systemd(args: argparse.Namespace) -> int:
     state_dir = get_state_dir(args.state_dir)
     cfg = load_access_config(state_dir)
@@ -470,9 +492,9 @@ def _cmd_systemd(args: argparse.Namespace) -> int:
     cwd = str(Path(raw_cwd).expanduser().resolve())
     exe = shutil.which("telegram-agy")
     src_dir = str(Path(__file__).resolve().parent.parent)
+    service_path = _build_service_path()
     q_state = _systemd_quote(str(state_dir))
     q_cwd = _systemd_quote(cwd)
-    q_src = _systemd_quote(src_dir)
     if exe:
         exec_start = f"{_systemd_quote(exe)} --state-dir {q_state} run --cwd {q_cwd}"
     else:
@@ -487,6 +509,7 @@ After=network-online.target
 [Service]
 Type=simple
 WorkingDirectory={q_cwd}
+Environment={_systemd_quote(f'PATH={service_path}')}
 Environment={_systemd_quote(f'PYTHONPATH={src_dir}')}
 Environment={_systemd_quote(f'TELEGRAM_AGY_STATE_DIR={state_dir}')}
 ExecStart={exec_start}

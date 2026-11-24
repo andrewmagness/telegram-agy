@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from .access import evaluate_inbound_message, is_authorized_callback_user
-from .agy_runner import VALID_MODES, AgyResult, AgyRunner
+from .agy_runner import VALID_MODES, AgyResult, AgyRunner, resolve_agy_bin
 from .config import (
     get_inbox_dir,
     load_access_config,
@@ -801,9 +801,19 @@ class TelegramBridge:
             self._bot_id = int(me["id"]) if "id" in me else None
             self._bot_username = str(me.get("username") or "")
             LOGGER.info("Connected as @%s (id=%s)", self._bot_username, self._bot_id)
+            resolved_bin = resolve_agy_bin(self.runner.agy_bin)
+            if resolved_bin == "agy" and not os.path.isabs(resolved_bin):
+                import shutil
+
+                if not shutil.which("agy"):
+                    LOGGER.warning(
+                        "Could not locate 'agy' binary on PATH or standard install locations; "
+                        "turns will fail until PATH is fixed."
+                    )
 
             self.relay.start()
             offset: int | None = load_offset(self.state_dir)
+            consecutive_errors = 0
 
             def _on_signal(_signum: int, _frame: Any) -> None:
                 self.stop()
@@ -822,9 +832,29 @@ class TelegramBridge:
                             timeout=25,
                             allowed_updates=["message", "callback_query"],
                         )
+                        consecutive_errors = 0
                     except TelegramAPIError as exc:
-                        LOGGER.warning("getUpdates error: %s", exc)
-                        self._stop_event.wait(3.0)
+                        consecutive_errors += 1
+                        delay = min(30.0, 2.0 * (2 ** min(consecutive_errors - 1, 4)))
+                        if exc.status == 409:
+                            delay = min(30.0, max(5.0, delay))
+                            LOGGER.warning(
+                                "getUpdates 409 Conflict (another instance is polling this bot token): %s",
+                                exc,
+                            )
+                        else:
+                            LOGGER.warning("getUpdates error (retry in %.0fs): %s", delay, exc)
+                        self._stop_event.wait(delay)
+                        continue
+                    except Exception as exc:
+                        consecutive_errors += 1
+                        delay = min(30.0, 2.0 * (2 ** min(consecutive_errors - 1, 4)))
+                        LOGGER.exception(
+                            "Unexpected getUpdates exception (retry in %.0fs): %s",
+                            delay,
+                            exc,
+                        )
+                        self._stop_event.wait(delay)
                         continue
 
                     for upd in updates:

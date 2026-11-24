@@ -95,7 +95,7 @@ class CliTests(unittest.TestCase):
                     0,
                 )
 
-            # systemd quotes paths with spaces
+            # systemd quotes paths with spaces and injects ~/.local/bin into PATH
             buf = io.StringIO()
             with redirect_stdout(buf):
                 rc = main(["--state-dir", str(state_dir), "systemd", "--cwd", str(ws)])
@@ -103,6 +103,8 @@ class CliTests(unittest.TestCase):
             unit = buf.getvalue()
             self.assertIn(f'WorkingDirectory="{ws.resolve()}"', unit)
             self.assertIn(f'--cwd "{ws.resolve()}"', unit)
+            self.assertIn('Environment="PATH=', unit)
+            self.assertIn(str(Path.home() / ".local" / "bin"), unit)
 
     def test_pid_matches_non_proc_fallback_fails_safe(self) -> None:
         with patch("telegram_agy.cli.Path.is_dir", return_value=False):
