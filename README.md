@@ -30,7 +30,7 @@ Bridge your Telegram bot to **Google Antigravity CLI (`agy`)** on your local mac
 Clone the repo (or install directly from GitHub once published):
 
 ```sh
-git clone https://github.com/<your-username>/telegram-agy.git
+git clone https://github.com/andrewmagness/telegram-agy.git
 cd telegram-agy
 
 # Install as an Antigravity plugin (adds skills, MCP tools, rules, and hook)
