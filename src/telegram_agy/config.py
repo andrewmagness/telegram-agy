@@ -3,15 +3,36 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import json
 import os
 import tempfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 DEFAULT_STATE_DIR = Path("~/.gemini/channels/telegram")
 
-DEFAULT_GUARDED_TOOLS = ["run_command", "write_file", "edit_file"]
+DEFAULT_SAFE_TOOLS = [
+    "read_file",
+    "view_file",
+    "view_file_outline",
+    "view_code_item",
+    "list_dir",
+    "find_by_name",
+    "grep_search",
+    "search_web",
+    "update_focus",
+    "update_steps",
+    "list_resources",
+    "read_resource",
+    "telegram_react",
+    "telegram_edit_message",
+    "telegram_download_attachment",
+]
+
+_T = TypeVar("_T")
 
 
 def default_access_config() -> dict[str, Any]:
@@ -32,7 +53,10 @@ def default_access_config() -> dict[str, Any]:
             "mode": "auto",
             "extraArgs": [],
             "approvalTimeoutSeconds": 120,
-            "guardedTools": list(DEFAULT_GUARDED_TOOLS),
+            "turnTimeoutSeconds": 600,
+            "allowedRoots": [],
+            "denyOversizedApprovals": False,
+            "safeTools": list(DEFAULT_SAFE_TOOLS),
         },
     }
 
@@ -42,22 +66,26 @@ def get_state_dir(override: str | Path | None = None, *, create: bool = True) ->
     raw = override if override is not None else os.environ.get("TELEGRAM_AGY_STATE_DIR")
     path = Path(raw).expanduser() if raw else DEFAULT_STATE_DIR.expanduser()
     if create:
+        existed = path.exists()
         path.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(path, 0o700)
-        except OSError:
-            pass
+        if not existed:
+            try:
+                os.chmod(path, 0o700)
+            except OSError:
+                pass
     return path
 
 
 def get_inbox_dir(state_dir: Path) -> Path:
     """Ensure and return the attachment inbox directory."""
     inbox = state_dir / "inbox"
+    existed = inbox.exists()
     inbox.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(inbox, 0o700)
-    except OSError:
-        pass
+    if not existed:
+        try:
+            os.chmod(inbox, 0o700)
+        except OSError:
+            pass
     return inbox
 
 
@@ -83,6 +111,22 @@ def atomic_write_text(path: Path, content: str, mode: int = 0o600) -> None:
 def atomic_write_json(path: Path, data: Any, mode: int = 0o600) -> None:
     """Atomically serialize *data* as formatted JSON to *path*."""
     atomic_write_text(path, json.dumps(data, indent=2, sort_keys=False) + "\n", mode=mode)
+
+
+@contextmanager
+def state_lock(state_dir: Path) -> Iterator[None]:
+    """Acquire an advisory exclusive flock across CLI and bridge processes."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = state_dir / ".state.lock"
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -124,7 +168,8 @@ def load_bot_token(state_dir: Path) -> str:
 def save_bot_token(state_dir: Path, token: str) -> Path:
     """Persist TELEGRAM_BOT_TOKEN to state_dir/.env with mode 0600."""
     env_path = state_dir / ".env"
-    write_env_file(env_path, {"TELEGRAM_BOT_TOKEN": token.strip()}, mode=0o600)
+    with state_lock(state_dir):
+        write_env_file(env_path, {"TELEGRAM_BOT_TOKEN": token.strip()}, mode=0o600)
     return env_path
 
 
@@ -160,6 +205,18 @@ def save_access_config(state_dir: Path, config: dict[str, Any]) -> Path:
     return path
 
 
+def update_access_config(
+    state_dir: Path,
+    mutator: Callable[[dict[str, Any]], _T],
+) -> tuple[dict[str, Any], _T]:
+    """Read, mutate, and atomically write access.json under state_lock."""
+    with state_lock(state_dir):
+        cfg = load_access_config(state_dir)
+        result = mutator(cfg)
+        save_access_config(state_dir, cfg)
+        return cfg, result
+
+
 def load_sessions(state_dir: Path) -> dict[str, dict[str, Any]]:
     """Load per-chat agy session metadata from sessions.json."""
     path = state_dir / "sessions.json"
@@ -178,4 +235,37 @@ def save_sessions(state_dir: Path, sessions: dict[str, dict[str, Any]]) -> Path:
     """Atomically write sessions.json with mode 0600."""
     path = state_dir / "sessions.json"
     atomic_write_json(path, sessions, mode=0o600)
+    return path
+
+
+def update_sessions(
+    state_dir: Path,
+    mutator: Callable[[dict[str, dict[str, Any]]], _T],
+) -> tuple[dict[str, dict[str, Any]], _T]:
+    """Read, mutate, and atomically write sessions.json under state_lock."""
+    with state_lock(state_dir):
+        sessions = load_sessions(state_dir)
+        result = mutator(sessions)
+        save_sessions(state_dir, sessions)
+        return sessions, result
+
+
+def load_offset(state_dir: Path) -> int | None:
+    """Load the persisted Telegram getUpdates offset, if present."""
+    path = state_dir / "offset.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if isinstance(data, dict) and isinstance(data.get("offset"), int):
+        return data["offset"]
+    return None
+
+
+def save_offset(state_dir: Path, offset: int) -> Path:
+    """Persist the next Telegram getUpdates offset atomically."""
+    path = state_dir / "offset.json"
+    atomic_write_json(path, {"offset": int(offset)}, mode=0o600)
     return path

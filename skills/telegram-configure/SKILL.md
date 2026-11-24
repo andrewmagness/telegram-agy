@@ -8,7 +8,7 @@ description: >-
 
 # Configure Telegram Channel for Antigravity (`telegram-agy`)
 
-Follow these steps to configure a Telegram bot for `agy` without ever echoing or committing the secret token.
+Follow these steps to configure a Telegram bot for `agy` without ever echoing, committing, or exposing the secret token in process lists (`ps`).
 
 ## 1. Create a Telegram Bot (if the user doesn't have a token yet)
 
@@ -19,21 +19,20 @@ Guide the user to create a bot in Telegram:
 
 ## 2. Save and Verify Configuration
 
-Locate the `telegram-agy` CLI (installed package `telegram-agy`, or fall back to running `PYTHONPATH="$PLUGIN_ROOT/src" python3 -m telegram_agy` from the plugin directory):
+Locate the `telegram-agy` CLI (installed `telegram-agy`, or `PYTHONPATH="${PLUGIN_ROOT:-.}/src" python3 -m telegram_agy`).
 
-- **If the user provided a token in their message** (or via env var):
-  Run without echoing the token back in chat:
+- **Preferred (avoids exposing the token in `ps` / shell history):**
+  Pipe via `--token-stdin` or run interactively without `--token`:
   ```sh
-  telegram-agy configure --token "<USER_TOKEN>"
+  printf '%s\n' "$TELEGRAM_BOT_TOKEN" | telegram-agy configure --token-stdin
   ```
-  Or if running directly from the plugin directory:
+  Or interactively (uses hidden `getpass` prompt):
   ```sh
-  PYTHONPATH="${PLUGIN_ROOT:-.}/src" python3 -m telegram_agy configure --token "<USER_TOKEN>"
+  telegram-agy configure
   ```
-- **If running interactively**, omit `--token` so the user can paste it at a hidden prompt, or ask the user for the token.
 - Optional flags:
   - `--cwd /path/to/workspace` — default working directory for `agy` turns triggered from Telegram
-  - `--permission-mode relay|sandbox-auto|full-auto` — default `relay` (uses `--sandbox` + Telegram `[Approve]` / `[Deny]` inline buttons)
+  - `--permission-mode relay|sandbox-auto|full-auto` — default `relay` (`--sandbox` + Telegram `[Approve]` / `[Deny]` inline buttons)
 
 This writes `TELEGRAM_BOT_TOKEN` to `~/.gemini/channels/telegram/.env` (mode `0600`), verifies it via Telegram's `getMe` API, and initializes `~/.gemini/channels/telegram/access.json` (mode `0600`) with `dmPolicy: "pairing"`.
 

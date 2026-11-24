@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+VALID_MODES = ("auto", "accept-edits", "plan")
 
 
 @dataclass
@@ -21,6 +24,7 @@ class AgyResult:
     error: str | None = None
     returncode: int = 0
     cancelled: bool = False
+    timed_out: bool = False
 
 
 def build_agy_command(
@@ -35,29 +39,37 @@ def build_agy_command(
     exec_cfg = execution_cfg or {}
     sess_cfg = session_cfg or {}
 
-    cmd = [agy_bin, "-p", prompt, "--output-format", "stream-json"]
+    cmd = [agy_bin, "--output-format", "stream-json"]
     if conversation_id:
-        cmd.extend(["--conversation", conversation_id])
+        conv = str(conversation_id).strip()
+        if conv.startswith("-"):
+            raise ValueError(f"Invalid conversation ID: {conv!r}")
+        cmd.append(f"--conversation={conv}")
 
     perm_mode = str(exec_cfg.get("permissionMode", "relay") or "relay").strip()
     sandbox = bool(exec_cfg.get("sandbox", True))
-    if perm_mode in ("relay", "sandbox-auto") or (perm_mode != "full-auto" and sandbox):
+    if sandbox:
         cmd.append("--sandbox")
     if perm_mode in ("sandbox-auto", "full-auto"):
         cmd.append("--dangerously-skip-permissions")
 
     mode = str(sess_cfg.get("mode") or exec_cfg.get("mode") or "").strip()
     if mode:
-        cmd.extend(["--mode", mode])
+        if mode.startswith("-") or mode not in VALID_MODES:
+            raise ValueError(f"Invalid agy mode: {mode!r}")
+        cmd.append(f"--mode={mode}")
 
     model = str(sess_cfg.get("model") or exec_cfg.get("model") or "").strip()
     if model:
-        cmd.extend(["--model", model])
+        if model.startswith("-"):
+            raise ValueError(f"Invalid model name: {model!r}")
+        cmd.append(f"--model={model}")
 
     for arg in exec_cfg.get("extraArgs") or []:
         if str(arg):
             cmd.append(str(arg))
 
+    cmd.extend(["-p", prompt])
     return cmd
 
 
@@ -168,6 +180,27 @@ def parse_stream_json_lines(lines: Iterable[str]) -> tuple[str, str | None, str 
     return text, conversation_id, error_msg
 
 
+def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    """Signal the entire process group started with `start_new_session=True`."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            return
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+
+
 class AgyRunner:
     """Runs `agy` turns serialized per Telegram chat/thread with cancellation support."""
 
@@ -192,16 +225,13 @@ class AgyRunner:
             return proc is not None and proc.poll() is None
 
     def cancel(self, session_key: str) -> bool:
-        """Terminate an in-progress turn for *session_key*. Returns True if signalled."""
+        """Terminate an in-progress turn and its child processes. Returns True if signalled."""
         with self._meta_lock:
             proc = self._active_procs.get(session_key)
             if proc is None or proc.poll() is not None:
                 return False
             self._cancelled_sessions.add(session_key)
-        try:
-            proc.terminate()
-        except OSError:
-            pass
+        _terminate_process_group(proc)
         return True
 
     def run_turn(
@@ -216,18 +246,25 @@ class AgyRunner:
         extra_env: dict[str, str] | None = None,
     ) -> AgyResult:
         """Execute a single `agy` turn for *session_key* and return `AgyResult`."""
+        exec_cfg = execution_cfg or {}
         lock = self._get_lock(session_key)
         with lock:
             cmd = build_agy_command(
                 prompt,
                 conversation_id=conversation_id,
-                execution_cfg=execution_cfg,
+                execution_cfg=exec_cfg,
                 session_cfg=session_cfg,
                 agy_bin=self.agy_bin,
             )
             env = os.environ.copy()
+            # Never leak TELEGRAM_BOT_TOKEN into the agent subprocess environment.
+            env.pop("TELEGRAM_BOT_TOKEN", None)
             if extra_env:
                 env.update(extra_env)
+
+            turn_timeout_raw = exec_cfg.get("turnTimeoutSeconds", 600)
+            turn_timeout = float(turn_timeout_raw) if turn_timeout_raw else 0.0
+            timeout = turn_timeout if turn_timeout > 0 else None
 
             proc = subprocess.Popen(
                 cmd,
@@ -238,13 +275,20 @@ class AgyRunner:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                start_new_session=True,
             )
             with self._meta_lock:
                 self._active_procs[session_key] = proc
                 self._cancelled_sessions.discard(session_key)
 
+            timed_out = False
             try:
-                stdout_data, stderr_data = proc.communicate()
+                try:
+                    stdout_data, stderr_data = proc.communicate(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    _terminate_process_group(proc)
+                    stdout_data, stderr_data = proc.communicate()
             finally:
                 with self._meta_lock:
                     self._active_procs.pop(session_key, None)
@@ -252,7 +296,9 @@ class AgyRunner:
                     self._cancelled_sessions.discard(session_key)
 
             text, new_conv_id, err_msg = parse_stream_json_lines(stdout_data.splitlines())
-            if proc.returncode != 0 and not err_msg:
+            if timed_out:
+                err_msg = f"agy turn timed out after {int(turn_timeout)}s"
+            elif proc.returncode != 0 and not err_msg:
                 stderr_clean = stderr_data.strip()
                 err_msg = stderr_clean or f"agy exited with status {proc.returncode}"
 
@@ -260,6 +306,7 @@ class AgyRunner:
                 text=text,
                 conversation_id=new_conv_id or conversation_id,
                 error=err_msg,
-                returncode=proc.returncode,
+                returncode=124 if timed_out else proc.returncode,
                 cancelled=was_cancelled,
+                timed_out=timed_out,
             )

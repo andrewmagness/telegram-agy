@@ -14,14 +14,15 @@ from .config import get_inbox_dir, get_state_dir, load_access_config, load_bot_t
 from .relay import send_relay_request
 from .telegram_api import TelegramClient
 
-SUPPORTED_PROTOCOL_VERSION = "2024-11-05"
+SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05", "2025-03-26")
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "name": "telegram_reply",
         "description": (
-            "Send a message and/or local files/images back to an authorized Telegram chat. "
-            "Automatically chunks long messages to Telegram's 4096-character limit."
+            "Send a message and/or local files/images back to the active Telegram chat. "
+            "Automatically chunks long messages to Telegram's 4096-character limit. "
+            "Set final=true only when this message is your complete final answer."
         ),
         "inputSchema": {
             "type": "object",
@@ -45,11 +46,21 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "files": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional list of local file paths to send as photos/documents.",
+                    "description": (
+                        "Optional list of local file paths (inside the active workspace or inbox) "
+                        "to send as photos/documents."
+                    ),
                 },
                 "parse_mode": {
                     "type": "string",
                     "description": "Optional Telegram parse_mode (e.g., Markdown or HTML).",
+                },
+                "final": {
+                    "type": "boolean",
+                    "description": (
+                        "Set true only if this reply is the complete final answer and the bridge "
+                        "should suppress trailing plain-text output."
+                    ),
                 },
             },
             "required": ["chat_id"],
@@ -70,7 +81,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "telegram_edit_message",
-        "description": "Edit a message previously sent by the bot in an authorized Telegram chat.",
+        "description": "Edit a message previously sent by the bot in the active Telegram chat.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -124,13 +135,44 @@ class TelegramMCPServer:
         return TelegramClient(token)
 
     def _require_authorized_chat(self, chat_id: str | int) -> None:
-        access_cfg = load_access_config(self.state_dir)
-        if not is_authorized_chat(access_cfg, chat_id):
+        chat_str = str(chat_id).strip()
+        pinned_chat = self.environ.get("TELEGRAM_AGY_CHAT_ID", "").strip()
+        if pinned_chat and chat_str != pinned_chat:
             raise PermissionError(
-                f"Chat {chat_id} is not authorized in {self.state_dir / 'access.json'}."
+                f"Chat {chat_str} does not match active turn chat {pinned_chat}."
+            )
+        access_cfg = load_access_config(self.state_dir)
+        if not is_authorized_chat(access_cfg, chat_str):
+            raise PermissionError(
+                f"Chat {chat_str} is not authorized in {self.state_dir / 'access.json'}."
             )
 
-    def _notify_relay_reply_sent(self) -> None:
+    def _validate_upload_path(self, raw_path: str) -> Path:
+        file_path = Path(raw_path).expanduser().resolve()
+        if not file_path.is_file():
+            raise FileNotFoundError(f"Attachment file not found: {file_path}")
+
+        resolved_state = self.state_dir.expanduser().resolve()
+        resolved_inbox = (resolved_state / "inbox").resolve()
+        if file_path == resolved_state or (
+            file_path.is_relative_to(resolved_state) and not file_path.is_relative_to(resolved_inbox)
+        ):
+            raise PermissionError(
+                f"Refusing to send protected telegram-agy state file: {file_path}"
+            )
+
+        allowed_roots = [resolved_inbox]
+        cwd_raw = self.environ.get("TELEGRAM_AGY_CWD", "").strip()
+        if cwd_raw:
+            allowed_roots.append(Path(cwd_raw).expanduser().resolve())
+
+        if not any(file_path.is_relative_to(root) for root in allowed_roots):
+            raise PermissionError(
+                f"Refusing to send file outside workspace/inbox: {file_path}"
+            )
+        return file_path
+
+    def _notify_relay_reply_sent(self, *, final: bool) -> None:
         relay_sock = self.environ.get("TELEGRAM_AGY_RELAY_SOCK", "").strip()
         turn_id = self.environ.get("TELEGRAM_AGY_TURN_ID", "").strip()
         if not relay_sock or not turn_id:
@@ -138,7 +180,7 @@ class TelegramMCPServer:
         try:
             send_relay_request(
                 relay_sock,
-                {"type": "mcp_reply_sent", "turnId": turn_id},
+                {"type": "mcp_reply_sent", "turnId": turn_id, "final": bool(final)},
                 timeout=2.0,
             )
         except Exception:
@@ -157,7 +199,8 @@ class TelegramMCPServer:
             reply_to = arguments.get("reply_to")
             thread_id = arguments.get("thread_id")
             parse_mode = arguments.get("parse_mode")
-            files = arguments.get("files") or []
+            final = bool(arguments.get("final", False))
+            files = [self._validate_upload_path(str(f)) for f in (arguments.get("files") or [])]
 
             sent_ids: list[int] = []
             if text:
@@ -168,23 +211,24 @@ class TelegramMCPServer:
                     message_thread_id=int(thread_id) if thread_id is not None else None,
                     parse_mode=str(parse_mode) if parse_mode else None,
                 )
-                sent_ids.extend(int(m["message_id"]) for m in msgs if isinstance(m, dict) and "message_id" in m)
+                sent_ids.extend(
+                    int(m["message_id"]) for m in msgs if isinstance(m, dict) and "message_id" in m
+                )
 
-            for file_item in files:
-                file_path = Path(str(file_item)).expanduser().resolve()
-                if not file_path.is_file():
-                    raise FileNotFoundError(f"Attachment file not found: {file_path}")
+            for file_path in files:
                 res = client.send_file(
                     chat_id,
                     file_path,
-                    reply_to_message_id=int(reply_to) if reply_to is not None and not sent_ids else None,
+                    reply_to_message_id=(
+                        int(reply_to) if reply_to is not None and not sent_ids else None
+                    ),
                     message_thread_id=int(thread_id) if thread_id is not None else None,
                 )
                 if isinstance(res, dict) and "message_id" in res:
                     sent_ids.append(int(res["message_id"]))
 
-            self._notify_relay_reply_sent()
-            summary = f"Sent to chat {chat_id} (message_ids={sent_ids})."
+            self._notify_relay_reply_sent(final=final)
+            summary = f"Sent to chat {chat_id} (message_ids={sent_ids}, final={final})."
             return {"content": [{"type": "text", "text": summary}], "isError": False}
 
         if name == "telegram_react":
@@ -239,15 +283,19 @@ class TelegramMCPServer:
         method = request.get("method")
         params = request.get("params") or {}
 
-        # Notifications have no id and expect no response.
         if req_id is None:
             return None
 
         try:
             if method == "initialize":
-                client_proto = params.get("protocolVersion") or SUPPORTED_PROTOCOL_VERSION
+                requested = str(params.get("protocolVersion") or "")
+                negotiated = (
+                    requested
+                    if requested in SUPPORTED_PROTOCOL_VERSIONS
+                    else SUPPORTED_PROTOCOL_VERSIONS[0]
+                )
                 result = {
-                    "protocolVersion": str(client_proto),
+                    "protocolVersion": negotiated,
                     "capabilities": {"tools": {}},
                     "serverInfo": {"name": "telegram-agy", "version": __version__},
                 }

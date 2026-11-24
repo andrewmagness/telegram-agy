@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import getpass
 import json
 import logging
@@ -19,18 +20,20 @@ from .access import (
     allow_group_user,
     allow_user,
     approve_pairing,
+    clear_pending,
     prune_expired_pending,
     remove_group,
     remove_user,
     set_dm_policy,
 )
+from .agy_runner import VALID_MODES
 from .bridge import TelegramBridge
 from .config import (
     get_state_dir,
     load_access_config,
     load_bot_token,
-    save_access_config,
     save_bot_token,
+    update_access_config,
 )
 from .mcp_server import TelegramMCPServer
 from .permission_hook import run_hook
@@ -45,6 +48,33 @@ def _pid_is_alive(pid: int) -> bool:
         return False
 
 
+def _pid_matches_telegram_agy(pid: int) -> bool:
+    cmdline_path = Path(f"/proc/{pid}/cmdline")
+    if not cmdline_path.exists():
+        return True
+    try:
+        raw = cmdline_path.read_bytes().decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    return "telegram_agy" in raw or "telegram-agy" in raw
+
+
+def _bridge_lock_held(state_dir: Path) -> bool:
+    lock_path = state_dir / "bridge.lock"
+    if not lock_path.exists():
+        return False
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
 def _read_pid(pid_file: Path) -> int | None:
     if not pid_file.exists():
         return None
@@ -56,12 +86,16 @@ def _read_pid(pid_file: Path) -> int | None:
 
 def _cmd_configure(args: argparse.Namespace) -> int:
     state_dir = get_state_dir(args.state_dir)
-    token = (args.token or "").strip()
-    if not token:
-        if sys.stdin.isatty():
-            token = getpass.getpass("Enter Telegram Bot Token from @BotFather: ").strip()
-        else:
-            token = sys.stdin.read().strip()
+    if args.token_stdin:
+        token = sys.stdin.read().strip()
+    elif args.token:
+        token = args.token.strip()
+    elif os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
+        token = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+    elif sys.stdin.isatty():
+        token = getpass.getpass("Enter Telegram Bot Token from @BotFather: ").strip()
+    else:
+        token = sys.stdin.read().strip()
 
     if not token or ":" not in token:
         print("Error: A valid Telegram bot token (<digits>:<secret>) is required.", file=sys.stderr)
@@ -76,14 +110,18 @@ def _cmd_configure(args: argparse.Namespace) -> int:
             return 1
 
     save_bot_token(state_dir, token)
-    access_cfg = load_access_config(state_dir)
-    if args.cwd:
-        access_cfg.setdefault("execution", {})["defaultCwd"] = str(Path(args.cwd).expanduser().resolve())
-    if args.permission_mode:
-        exec_cfg = access_cfg.setdefault("execution", {})
-        exec_cfg["permissionMode"] = args.permission_mode
-        exec_cfg["sandbox"] = args.permission_mode != "full-auto"
-    save_access_config(state_dir, access_cfg)
+
+    def _mutate(cfg: dict[str, Any]) -> None:
+        if args.cwd:
+            cfg.setdefault("execution", {})["defaultCwd"] = str(
+                Path(args.cwd).expanduser().resolve()
+            )
+        if args.permission_mode:
+            exec_cfg = cfg.setdefault("execution", {})
+            exec_cfg["permissionMode"] = args.permission_mode
+            exec_cfg["sandbox"] = args.permission_mode != "full-auto"
+
+    update_access_config(state_dir, _mutate)
 
     username = bot_info.get("username")
     if username:
@@ -100,22 +138,22 @@ def _cmd_configure(args: argparse.Namespace) -> int:
 
 def _cmd_access(args: argparse.Namespace) -> int:
     state_dir = get_state_dir(args.state_dir)
-    cfg = load_access_config(state_dir)
     sub = args.access_cmd
 
     if sub == "show":
-        if prune_expired_pending(cfg):
-            save_access_config(state_dir, cfg)
+        def _prune(cfg: dict[str, Any]) -> bool:
+            return prune_expired_pending(cfg)
+
+        cfg, _ = update_access_config(state_dir, _prune)
         print(json.dumps(cfg, indent=2))
         return 0
 
     if sub == "pair":
         try:
-            entry = approve_pairing(cfg, args.code)
+            _, entry = update_access_config(state_dir, lambda cfg: approve_pairing(cfg, args.code))
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
-        save_access_config(state_dir, cfg)
         print(f"Paired Telegram user {entry['userId']} (@{entry.get('username') or 'unknown'}).")
         token = load_bot_token(state_dir)
         if token and entry.get("chatId"):
@@ -128,39 +166,53 @@ def _cmd_access(args: argparse.Namespace) -> int:
                 pass
         return 0
 
+    if sub == "clear-pending":
+        _, count = update_access_config(state_dir, clear_pending)
+        print(f"Cleared {count} pending pairing request(s).")
+        return 0
+
     if sub == "allow":
-        added = allow_user(cfg, args.user_id)
-        save_access_config(state_dir, cfg)
+        _, added = update_access_config(state_dir, lambda cfg: allow_user(cfg, args.user_id))
         print("User added to allowFrom." if added else "User already in allowFrom.")
         return 0
 
     if sub == "remove":
-        removed = remove_user(cfg, args.user_id)
-        save_access_config(state_dir, cfg)
+        _, removed = update_access_config(state_dir, lambda cfg: remove_user(cfg, args.user_id))
         print("User removed from allowFrom." if removed else "User was not in allowFrom.")
         return 0
 
     if sub == "policy":
-        set_dm_policy(cfg, args.policy)
-        save_access_config(state_dir, cfg)
+        cfg, _ = update_access_config(state_dir, lambda c: set_dm_policy(c, args.policy))
         print(f"dmPolicy set to {cfg['dmPolicy']}.")
         return 0
 
     if sub == "group":
         gsub = args.group_cmd
         if gsub == "add":
-            add_group(cfg, args.chat_id, require_mention=not args.no_mention)
-            save_access_config(state_dir, cfg)
-            print(f"Group {args.chat_id} added (requireMention={not args.no_mention}).")
+            update_access_config(
+                state_dir,
+                lambda c: add_group(
+                    c,
+                    args.chat_id,
+                    require_mention=not args.no_mention,
+                    allow_all_members=bool(args.allow_all),
+                ),
+            )
+            print(
+                f"Group {args.chat_id} added "
+                f"(requireMention={not args.no_mention}, allowAllMembers={bool(args.allow_all)})."
+            )
             return 0
         if gsub == "remove":
-            removed = remove_group(cfg, args.chat_id)
-            save_access_config(state_dir, cfg)
+            _, removed = update_access_config(
+                state_dir, lambda c: remove_group(c, args.chat_id)
+            )
             print(f"Group {args.chat_id} removed." if removed else f"Group {args.chat_id} not found.")
             return 0
         if gsub == "allow":
-            added = allow_group_user(cfg, args.chat_id, args.user_id)
-            save_access_config(state_dir, cfg)
+            _, added = update_access_config(
+                state_dir, lambda c: allow_group_user(c, args.chat_id, args.user_id)
+            )
             print(
                 f"User {args.user_id} added to group {args.chat_id}."
                 if added
@@ -171,39 +223,59 @@ def _cmd_access(args: argparse.Namespace) -> int:
     if sub == "set":
         key = args.key
         raw_val = args.value
-        exec_keys = {
-            "defaultCwd",
-            "permissionMode",
-            "sandbox",
-            "model",
-            "mode",
-            "approvalTimeoutSeconds",
-        }
-        top_keys = {"ackReaction", "textChunkLimit", "replyToMode"}
-        if key in exec_keys:
+
+        def _apply_set(cfg: dict[str, Any]) -> None:
             exec_cfg = cfg.setdefault("execution", {})
             if key == "sandbox":
                 exec_cfg[key] = raw_val.lower() in ("1", "true", "yes", "on")
+            elif key == "denyOversizedApprovals":
+                exec_cfg[key] = raw_val.lower() in ("1", "true", "yes", "on")
             elif key == "approvalTimeoutSeconds":
-                exec_cfg[key] = int(raw_val)
+                val = int(raw_val)
+                if not 5 <= val <= 120:
+                    raise ValueError("approvalTimeoutSeconds must be between 5 and 120.")
+                exec_cfg[key] = val
+            elif key == "turnTimeoutSeconds":
+                val = int(raw_val)
+                if not 0 <= val <= 86400:
+                    raise ValueError("turnTimeoutSeconds must be between 0 and 86400.")
+                exec_cfg[key] = val
             elif key == "permissionMode":
                 if raw_val not in ("relay", "sandbox-auto", "full-auto"):
-                    print("Error: permissionMode must be relay, sandbox-auto, or full-auto.", file=sys.stderr)
-                    return 1
+                    raise ValueError("permissionMode must be relay, sandbox-auto, or full-auto.")
                 exec_cfg[key] = raw_val
-            elif key == "defaultCwd" and raw_val:
-                exec_cfg[key] = str(Path(raw_val).expanduser().resolve())
-            else:
+            elif key == "mode":
+                if raw_val not in VALID_MODES:
+                    raise ValueError(f"mode must be one of: {', '.join(VALID_MODES)}.")
                 exec_cfg[key] = raw_val
-        elif key in top_keys:
-            if key == "textChunkLimit":
-                cfg[key] = int(raw_val)
-            else:
+            elif key == "model":
+                if raw_val.startswith("-"):
+                    raise ValueError("model cannot start with '-'.")
+                exec_cfg[key] = raw_val
+            elif key == "defaultCwd":
+                exec_cfg[key] = str(Path(raw_val).expanduser().resolve()) if raw_val else ""
+            elif key == "allowedRoots":
+                roots = [
+                    str(Path(p.strip()).expanduser().resolve())
+                    for p in raw_val.split(",")
+                    if p.strip()
+                ]
+                exec_cfg[key] = roots
+            elif key == "textChunkLimit":
+                val = int(raw_val)
+                if not 64 <= val <= 4096:
+                    raise ValueError("textChunkLimit must be between 64 and 4096.")
+                cfg[key] = val
+            elif key in ("ackReaction", "replyToMode"):
                 cfg[key] = raw_val
-        else:
-            print(f"Error: Unknown config key {key!r}.", file=sys.stderr)
+            else:
+                raise ValueError(f"Unknown config key {key!r}.")
+
+        try:
+            update_access_config(state_dir, _apply_set)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
             return 1
-        save_access_config(state_dir, cfg)
         print(f"Updated {key}.")
         return 0
 
@@ -222,7 +294,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
     cwd = Path(args.cwd).expanduser().resolve() if args.cwd else Path.cwd().resolve()
     bridge = TelegramBridge(state_dir, TelegramClient(token), default_cwd=cwd)
-    bridge.run_forever()
+    try:
+        bridge.run_forever()
+    except RuntimeError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -235,8 +311,8 @@ def _cmd_start(args: argparse.Namespace) -> int:
 
     pid_file = state_dir / "bridge.pid"
     existing_pid = _read_pid(pid_file)
-    if existing_pid and _pid_is_alive(existing_pid):
-        print(f"Bridge is already running (PID {existing_pid}).")
+    if (existing_pid and _pid_is_alive(existing_pid) and _pid_matches_telegram_agy(existing_pid)) or _bridge_lock_held(state_dir):
+        print(f"Bridge is already running (PID {existing_pid or 'locked'}).")
         return 0
 
     log_file = state_dir / "bridge.log"
@@ -275,6 +351,12 @@ def _cmd_stop(args: argparse.Namespace) -> int:
             pid_file.unlink()
         print("Bridge is not running.")
         return 0
+    if not _pid_matches_telegram_agy(pid):
+        print(
+            f"Refusing to kill PID {pid}: process does not appear to be telegram-agy.",
+            file=sys.stderr,
+        )
+        return 1
     os.kill(pid, 15)  # SIGTERM
     for _ in range(30):
         if not _pid_is_alive(pid):
@@ -292,7 +374,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
     state_dir = get_state_dir(args.state_dir)
     pid_file = state_dir / "bridge.pid"
     pid = _read_pid(pid_file)
-    running = bool(pid and _pid_is_alive(pid))
+    running = bool(
+        (pid and _pid_is_alive(pid) and _pid_matches_telegram_agy(pid))
+        or _bridge_lock_held(state_dir)
+    )
     token = load_bot_token(state_dir)
     sock_exists = (state_dir / "relay.sock").exists()
     cfg = load_access_config(state_dir)
@@ -300,7 +385,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "running": running,
-                "pid": pid if running else None,
+                "pid": pid if (pid and _pid_is_alive(pid)) else None,
                 "stateDir": str(state_dir),
                 "tokenConfigured": bool(token),
                 "relaySocket": sock_exists,
@@ -330,12 +415,15 @@ def _cmd_logs(args: argparse.Namespace) -> int:
 
 def _cmd_systemd(args: argparse.Namespace) -> int:
     state_dir = get_state_dir(args.state_dir)
+    cfg = load_access_config(state_dir)
+    raw_cwd = args.cwd or (cfg.get("execution") or {}).get("defaultCwd") or str(Path.cwd())
+    cwd = str(Path(raw_cwd).expanduser().resolve())
     exe = shutil.which("telegram-agy")
     src_dir = str(Path(__file__).resolve().parent.parent)
     exec_start = (
-        f"{exe} --state-dir {state_dir} run"
+        f"{exe} --state-dir {state_dir} run --cwd {cwd}"
         if exe
-        else f"{sys.executable} -m telegram_agy --state-dir {state_dir} run"
+        else f"{sys.executable} -m telegram_agy --state-dir {state_dir} run --cwd {cwd}"
     )
     unit = f"""[Unit]
 Description=Telegram Channel Bridge for Antigravity CLI (agy)
@@ -343,6 +431,7 @@ After=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory={cwd}
 Environment=PYTHONPATH={src_dir}
 Environment=TELEGRAM_AGY_STATE_DIR={state_dir}
 ExecStart={exec_start}
@@ -362,7 +451,8 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     p_cfg = subparsers.add_parser("configure", help="Configure Telegram bot token and defaults")
-    p_cfg.add_argument("--token", default="", help="Telegram bot token from @BotFather")
+    p_cfg.add_argument("--token", default="", help="Telegram bot token (prefer --token-stdin or prompt)")
+    p_cfg.add_argument("--token-stdin", action="store_true", help="Read bot token from stdin")
     p_cfg.add_argument("--cwd", default="", help="Default workspace directory")
     p_cfg.add_argument(
         "--permission-mode",
@@ -376,6 +466,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_acc = subparsers.add_parser("access", help="Manage pairing codes, allowlists, and policies")
     acc_sub = p_acc.add_subparsers(dest="access_cmd", required=True)
     acc_sub.add_parser("show", help="Show current access.json").set_defaults(func=_cmd_access)
+    acc_sub.add_parser("clear-pending", help="Clear all pending pairing requests").set_defaults(
+        func=_cmd_access
+    )
 
     p_pair = acc_sub.add_parser("pair", help="Approve a 6-character pairing code")
     p_pair.add_argument("code")
@@ -398,6 +491,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_gadd = grp_sub.add_parser("add", help="Allow a group chat ID")
     p_gadd.add_argument("chat_id")
     p_gadd.add_argument("--no-mention", action="store_true", help="Do not require @bot mention")
+    p_gadd.add_argument(
+        "--allow-all",
+        action="store_true",
+        help="Allow all members of this group (by default only allowlisted users are permitted)",
+    )
     p_gadd.set_defaults(func=_cmd_access)
     p_grem = grp_sub.add_parser("remove", help="Remove a group chat ID")
     p_grem.add_argument("chat_id")
@@ -435,9 +533,10 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("hook", help="Run the PreToolUse permission relay hook").set_defaults(
         func=lambda _a: run_hook()
     )
-    subparsers.add_parser("systemd", help="Print systemd --user unit file").set_defaults(
-        func=_cmd_systemd
-    )
+
+    p_sysd = subparsers.add_parser("systemd", help="Print systemd --user unit file")
+    p_sysd.add_argument("--cwd", default="", help="Workspace directory for WorkingDirectory and --cwd")
+    p_sysd.set_defaults(func=_cmd_systemd)
     return parser
 
 

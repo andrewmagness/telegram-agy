@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -44,6 +45,17 @@ def prune_expired_pending(config: dict[str, Any], now: float | None = None) -> b
     return bool(expired)
 
 
+def clear_pending(config: dict[str, Any]) -> int:
+    """Clear all pending pairing codes. Returns the number removed."""
+    pending = config.get("pending")
+    if not isinstance(pending, dict):
+        config["pending"] = {}
+        return 0
+    count = len(pending)
+    pending.clear()
+    return count
+
+
 def _generate_pairing_code(pending: dict[str, Any]) -> str:
     for _ in range(16):
         code = secrets.token_hex(3).upper()
@@ -67,11 +79,15 @@ def _message_mentions_bot(
         return False
 
     needle = f"@{bot_username.lower()}"
+    mention_re = re.compile(
+        rf"(?:^|[^A-Za-z0-9_])@{re.escape(bot_username)}(?![A-Za-z0-9_])",
+        re.IGNORECASE,
+    )
     for text_key, entities_key in (("text", "entities"), ("caption", "caption_entities")):
         body = message.get(text_key) or ""
         if not body:
             continue
-        if needle in body.lower():
+        if mention_re.search(body):
             return True
         for entity in message.get(entities_key) or []:
             if not isinstance(entity, dict):
@@ -183,9 +199,11 @@ def evaluate_inbound_message(
         if not isinstance(group_cfg, dict) or group_cfg.get("enabled") is False:
             return AccessDecision(allowed=False, reason="group_not_allowed")
 
-        group_allow = [str(x) for x in group_cfg.get("allowFrom", [])]
-        if group_allow and user_id_str not in group_allow:
-            return AccessDecision(allowed=False, reason="group_sender_not_allowed")
+        if not group_cfg.get("allowAllMembers"):
+            group_allow = {str(x) for x in group_cfg.get("allowFrom", [])}
+            effective_allow = group_allow if group_allow else allow_from
+            if user_id_str not in effective_allow:
+                return AccessDecision(allowed=False, reason="group_sender_not_allowed")
 
         if group_cfg.get("requireMention", True):
             if not _message_mentions_bot(message, bot_id=bot_id, bot_username=bot_username):
@@ -286,6 +304,7 @@ def add_group(
     chat_id: str | int,
     *,
     require_mention: bool = True,
+    allow_all_members: bool = False,
 ) -> None:
     """Allow a Telegram group/supergroup chat ID."""
     chat_str = str(chat_id).strip()
@@ -296,6 +315,7 @@ def add_group(
     groups[chat_str] = {
         "enabled": True,
         "requireMention": require_mention,
+        "allowAllMembers": allow_all_members,
         "allowFrom": list(existing.get("allowFrom", [])),
     }
 

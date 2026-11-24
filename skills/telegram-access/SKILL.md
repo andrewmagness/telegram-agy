@@ -19,11 +19,11 @@ Run `telegram-agy access ...` (or `PYTHONPATH="${PLUGIN_ROOT:-.}/src" python3 -m
   ```sh
   telegram-agy access show
   ```
-- **Approve a 6-character DM pairing code:**
+- **Approve or clear pending DM pairing codes:**
   ```sh
   telegram-agy access pair <CODE>
+  telegram-agy access clear-pending
   ```
-  Moves the pending Telegram user ID into `allowFrom`, deletes the pending code, and (if a bot token is configured) sends a confirmation message to that Telegram chat.
 - **Directly allow or remove a numeric Telegram user ID:**
   ```sh
   telegram-agy access allow <USER_ID>
@@ -35,13 +35,11 @@ Run `telegram-agy access ...` (or `PYTHONPATH="${PLUGIN_ROOT:-.}/src" python3 -m
   telegram-agy access policy allowlist
   telegram-agy access policy disabled
   ```
-  - `pairing` (default): unknown DMs receive a 6-char code and are blocked until paired.
-  - `allowlist`: unknown DMs are dropped silently.
-  - `disabled`: all DMs are ignored.
-- **Manage group chats (opt-in by `chat_id`, default `requireMention: true`):**
+- **Manage group chats (opt-in by `chat_id`, default `requireMention: true` and fail-closed to allowlisted users):**
   ```sh
   telegram-agy access group add <CHAT_ID>
   telegram-agy access group add <CHAT_ID> --no-mention
+  telegram-agy access group add <CHAT_ID> --allow-all
   telegram-agy access group allow <CHAT_ID> <USER_ID>
   telegram-agy access group remove <CHAT_ID>
   ```
@@ -50,10 +48,13 @@ Run `telegram-agy access ...` (or `PYTHONPATH="${PLUGIN_ROOT:-.}/src" python3 -m
   telegram-agy access set permissionMode relay          # relay | sandbox-auto | full-auto
   telegram-agy access set sandbox true                  # true | false
   telegram-agy access set defaultCwd /path/to/project
+  telegram-agy access set allowedRoots /path/one,/path/two
   telegram-agy access set model ""
   telegram-agy access set mode auto                     # auto | accept-edits | plan
   telegram-agy access set ackReaction 👀
-  telegram-agy access set approvalTimeoutSeconds 120
+  telegram-agy access set approvalTimeoutSeconds 120    # 5..120
+  telegram-agy access set turnTimeoutSeconds 600        # 0..86400
+  telegram-agy access set denyOversizedApprovals false  # true | false
   ```
 
 Always run `telegram-agy access show` afterward to verify the updated configuration and report the current state concisely.

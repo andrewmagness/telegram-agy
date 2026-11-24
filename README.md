@@ -6,14 +6,14 @@ Bridge your Telegram bot to **Google Antigravity CLI (`agy`)** on your local mac
 
 - **Native Antigravity Plugin**: Installs cleanly with `agy plugin install` and adds:
   - **Skills**: `telegram-configure`, `telegram-access`, `telegram-bridge`
-  - **MCP Server (`telegram-agy`)**: Exposes `telegram_reply`, `telegram_react`, `telegram_edit_message`, and `telegram_download_attachment`
-  - **Channel Rules (`rules/AGENTS.md`)**: Teaches `agy` how to read `<channel source="telegram" ...>` envelopes and format mobile-friendly replies
-  - **Permission Relay Hook (`hooks.json`)**: `PreToolUse` hook that sends inline `[Approve]` / `[Always (session)]` / `[Deny]` buttons to Telegram when guarded tools (`run_command`, `write_file`, `edit_file`) are invoked in `relay` mode
+  - **MCP Server (`telegram-agy`)**: Exposes `telegram_reply`, `telegram_react`, `telegram_edit_message`, and `telegram_download_attachment` (pinned to the active turn's chat and restricted to workspace/inbox files)
+  - **Channel Rules (`rules/AGENTS.md`)**: Teaches `agy` how to read `<channel source="telegram" ...>` envelopes and `<quoted_reply untrusted="true">` blocks
+  - **Permission Relay Hook (`hooks.json`)**: `PreToolUse` hook that passes through (`allow`) in normal interactive `agy` sessions, and in Telegram bridge `relay` mode prompts via inline `[Approve]` / `[Always (session)]` / `[Deny]` buttons for any tool outside `safeTools`
 - **Fail-Closed Pairing & Access Control**:
   - Defaults to `dmPolicy: "pairing"`: unknown DM senders receive a 6-character pairing code (1h TTL, max 3 pending) and are blocked until approved locally
-  - Supports `allowlist` and `disabled` DM policies, plus opt-in group chats with `requireMention` (`@bot` or reply-to-bot) and per-group `allowFrom`
+  - Supports `allowlist` and `disabled` DM policies, plus opt-in group chats with `requireMention` (`@bot` or reply-to-bot) and fail-closed `allowFrom` (falling back to global `allowFrom` unless `--allow-all` is passed)
 - **Persistent Per-Chat `agy` Sessions**:
-  - Tracks `conversationId` per chat/topic in `sessions.json` and resumes with `agy --conversation <id>`
+  - Tracks `conversationId` per chat/topic in `sessions.json` and resumes with `agy --conversation=<id>`
   - Supports attachments (photos, documents, voice, audio, video, stickers saved to `~/.gemini/channels/telegram/inbox/`), emoji `ackReaction`, typing indicators, and code-block-aware 4096-char message chunking
   - Built-in Telegram chat commands: `/new`, `/status`, `/cd <path>`, `/model [name]`, `/mode [auto|accept-edits|plan]`, `/cancel`, `/help`
 
@@ -27,7 +27,7 @@ Bridge your Telegram bot to **Google Antigravity CLI (`agy`)** on your local mac
 3. Copy the bot token (`<digits>:<secret>`).
 
 ### 2. Install the Plugin & CLI
-Clone the repo (or install directly from GitHub once published):
+Clone the repo (or install the plugin directly from GitHub):
 
 ```sh
 git clone https://github.com/andrewmagness/telegram-agy.git
@@ -35,19 +35,33 @@ cd telegram-agy
 
 # Install as an Antigravity plugin (adds skills, MCP tools, rules, and hook)
 agy plugin install .
-
-# Optional: install the CLI entrypoint globally
-pip install -e .
 ```
 
-You can also run directly without `pip install` via `PYTHONPATH=src python3 -m telegram_agy ...`.
+To install the `telegram-agy` CLI entrypoint:
+
+- **Debian / Ubuntu (PEP 668 `externally-managed-environment` safe)**:
+  ```sh
+  # Option A: zero-dependency launcher script (no pip/pipx needed)
+  mkdir -p ~/.local/bin
+  printf '#!/usr/bin/env sh\nPYTHONPATH="%s/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m telegram_agy "$@"\n' "$PWD" > ~/.local/bin/telegram-agy
+  chmod +x ~/.local/bin/telegram-agy
+
+  # Option B: pipx
+  pipx install -e .
+  ```
+- **Standard Python environments**:
+  ```sh
+  pip install -e .
+  ```
 
 ### 3. Configure Your Bot Token
-Either ask `agy` using the `telegram-configure` skill, or run:
+Run interactively (hidden prompt—keeps the token out of `ps` and shell history) or pipe via `--token-stdin`:
 
 ```sh
-telegram-agy configure --token "<YOUR_BOT_TOKEN>" --cwd /path/to/your/workspace
+telegram-agy configure --cwd /path/to/your/workspace
 ```
+
+*(Or pipe via stdin: `printf '%s\n' "$TELEGRAM_BOT_TOKEN" | telegram-agy configure --token-stdin --cwd /path/to/your/workspace`.)*
 
 This validates the token against Telegram's `getMe` endpoint and saves it with `0600` permissions to `~/.gemini/channels/telegram/.env`.
 
@@ -75,17 +89,23 @@ You can now chat with `agy` directly from Telegram!
 
 ---
 
-## Permission Modes
+## Permission Modes & Safety Controls
 
 Configure how `agy` handles tool execution for Telegram-originated turns via `telegram-agy access set permissionMode <mode>`:
 
 | Mode | Behavior |
 | :--- | :--- |
-| `relay` *(default)* | Runs `agy --sandbox` and intercepts guarded tools (`run_command`, `write_file`, `edit_file`) via `PreToolUse`, prompting you in Telegram with `[Approve]`, `[Always (session)]`, and `[Deny]` inline buttons. |
-| `sandbox-auto` | Runs `agy --sandbox --dangerously-skip-permissions` (auto-approves within Antigravity's sandbox). |
-| `full-auto` | Runs `agy --dangerously-skip-permissions` without sandbox restrictions (for trusted paired users only). |
+| `relay` *(default)* | Runs `agy --sandbox`. Tools in `safeTools` (read-only built-ins + safe messaging tools) auto-approve; **everything else** (including `run_command`, file edits, subagents, unknown MCP tools, and `telegram_reply` with `files`) prompts you in Telegram with `[Approve]`, `[Always (session)]`, and `[Deny]` inline buttons. |
+| `sandbox-auto` | Runs `agy --sandbox --dangerously-skip-permissions` (auto-approves within Antigravity's sandbox; writes targeting `~/.gemini/channels/telegram/` outside `inbox/` remain blocked). |
+| `full-auto` | Runs `agy --dangerously-skip-permissions` (with `--sandbox` disabled unless set via `access set sandbox true`). |
 
-Normal interactive `agy` sessions outside the Telegram bridge are unaffected because the `PreToolUse` hook passes through (`{}`) whenever `TELEGRAM_AGY_RELAY_SOCK` is unset.
+Additional hardening knobs (`telegram-agy access set <key> <value>`):
+- `allowedRoots` — comma-separated list of directories `/cd` is confined to (empty = allow any directory for global owners)
+- `approvalTimeoutSeconds` — `5..120` seconds (default `120`)
+- `turnTimeoutSeconds` — max runtime per `agy` turn in seconds (`0..86400`, default `600`)
+- `denyOversizedApprovals` — `false` (default: attach full JSON arguments above 3800 chars before the prompt) or `true` (auto-deny oversized tool arguments)
+
+Normal interactive `agy` sessions outside the Telegram bridge are unaffected because `PreToolUse` returns `{"decision": "allow"}` whenever `TELEGRAM_AGY_RELAY_SOCK` is unset.
 
 ---
 
@@ -95,10 +115,10 @@ Once paired, send these commands in Telegram:
 
 - `/new` — Start a fresh `agy` conversation for this chat
 - `/status` — Show active workspace (`cwd`), `conversationId`, model, mode, and permission policy
-- `/cd <path>` — Switch the active workspace directory for this chat (resets conversation)
+- `/cd <path>` — Switch the active workspace directory for this chat (global owners only; resets conversation)
 - `/model [name]` — View or switch the `agy` model for this chat
 - `/mode [auto|accept-edits|plan]` — View or switch the `agy` execution mode
-- `/cancel` — Abort an in-progress `agy` turn
+- `/cancel` — Abort an in-progress `agy` turn (and its child process group)
 - `/help` — Show command help
 
 ---
@@ -108,10 +128,11 @@ Once paired, send these commands in Telegram:
 ```sh
 telegram-agy access show
 telegram-agy access pair <CODE>
+telegram-agy access clear-pending
 telegram-agy access allow <USER_ID>
 telegram-agy access remove <USER_ID>
 telegram-agy access policy <pairing|allowlist|disabled>
-telegram-agy access group add <CHAT_ID> [--no-mention]
+telegram-agy access group add <CHAT_ID> [--no-mention] [--allow-all]
 telegram-agy access group allow <CHAT_ID> <USER_ID>
 telegram-agy access group remove <CHAT_ID>
 telegram-agy access set <KEY> <VALUE>
@@ -119,35 +140,10 @@ telegram-agy access set <KEY> <VALUE>
 
 ---
 
-## Architecture
-
-```text
-Telegram User
-   │  (Bot API long-polling / inline callbacks)
-   ▼
-telegram-agy bridge daemon  ◄─── Unix socket (relay.sock) ───► PreToolUse Hook
-   │                                                              ▲
-   │  spawns per-turn `agy -p ... --output-format stream-json`    │
-   ▼                                                              │
-Antigravity CLI (agy) ──(stdio)──► telegram-agy MCP server ───────┘
-                                   (telegram_reply, telegram_react,
-                                    telegram_edit_message,
-                                    telegram_download_attachment)
-```
-
-State is stored under `~/.gemini/channels/telegram/` (override with `TELEGRAM_AGY_STATE_DIR`):
-- `.env` (`0600`) — `TELEGRAM_BOT_TOKEN`
-- `access.json` (`0600`) — `dmPolicy`, `allowFrom`, `groups`, `pending`, `execution` settings
-- `sessions.json` (`0600`) — per-chat `conversationId`, `cwd`, `model`, `mode`
-- `inbox/` — downloaded Telegram attachments
-- `bridge.pid`, `bridge.log`, `relay.sock` — daemon runtime files
-
----
-
 ## Running as a Background User Service (`systemd`)
 
 ```sh
-telegram-agy systemd > ~/.config/systemd/user/telegram-agy.service
+telegram-agy systemd --cwd /path/to/your/workspace > ~/.config/systemd/user/telegram-agy.service
 systemctl --user daemon-reload
 systemctl --user enable --now telegram-agy.service
 ```

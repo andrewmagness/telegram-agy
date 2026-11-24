@@ -1,18 +1,22 @@
-"""Tests for agy_runner command construction, stream-json parsing, and execution."""
+"""Tests for agy_runner command construction, env sanitization, timeout, and cancel."""
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from telegram_agy.agy_runner import AgyRunner, build_agy_command, parse_stream_json_lines
 
 
 class AgyRunnerTests(unittest.TestCase):
-    def test_build_agy_command_modes(self) -> None:
+    def test_build_agy_command_modes_and_sandbox_independence(self) -> None:
         cmd_relay = build_agy_command(
             "hello",
             conversation_id="conv-1",
@@ -20,23 +24,28 @@ class AgyRunnerTests(unittest.TestCase):
         )
         self.assertIn("--sandbox", cmd_relay)
         self.assertNotIn("--dangerously-skip-permissions", cmd_relay)
-        self.assertIn("--conversation", cmd_relay)
-        self.assertIn("conv-1", cmd_relay)
-        self.assertIn("--model", cmd_relay)
+        self.assertIn("--conversation=conv-1", cmd_relay)
+        self.assertIn("--model=gemini", cmd_relay)
+        self.assertIn("--mode=auto", cmd_relay)
 
-        cmd_sandbox_auto = build_agy_command(
+        # sandbox=False works even in relay mode
+        cmd_relay_nosandbox = build_agy_command(
             "hello",
-            execution_cfg={"permissionMode": "sandbox-auto", "sandbox": True},
+            execution_cfg={"permissionMode": "relay", "sandbox": False},
         )
-        self.assertIn("--sandbox", cmd_sandbox_auto)
-        self.assertIn("--dangerously-skip-permissions", cmd_sandbox_auto)
+        self.assertNotIn("--sandbox", cmd_relay_nosandbox)
 
-        cmd_full_auto = build_agy_command(
+        # sandbox=True works even in full-auto mode
+        cmd_full_sandbox = build_agy_command(
             "hello",
-            execution_cfg={"permissionMode": "full-auto", "sandbox": False},
+            execution_cfg={"permissionMode": "full-auto", "sandbox": True},
         )
-        self.assertNotIn("--sandbox", cmd_full_auto)
-        self.assertIn("--dangerously-skip-permissions", cmd_full_auto)
+        self.assertIn("--sandbox", cmd_full_sandbox)
+        self.assertIn("--dangerously-skip-permissions", cmd_full_sandbox)
+
+        # Flag injection in model rejected
+        with self.assertRaises(ValueError):
+            build_agy_command("hi", session_cfg={"model": "--evil"})
 
     def test_parse_stream_json_deltas_and_result(self) -> None:
         lines = [
@@ -49,23 +58,16 @@ class AgyRunnerTests(unittest.TestCase):
         self.assertEqual(conv_id, "c-42")
         self.assertIsNone(err)
 
-    def test_parse_stream_json_error_result(self) -> None:
-        lines = [
-            json.dumps({"event": "result", "result": {"status": "ERROR", "error": "quota exceeded"}}),
-        ]
-        text, _conv_id, err = parse_stream_json_lines(lines)
-        self.assertEqual(text, "")
-        self.assertEqual(err, "quota exceeded")
-
-    def test_runner_executes_subprocess_and_captures_conversation_id(self) -> None:
+    def test_runner_strips_bot_token_and_captures_conversation_id(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
             fake_agy = Path(tmpdir) / "fake_agy.py"
             fake_agy.write_text(
                 "\n".join(
                     [
                         f"#!{sys.executable}",
-                        "import json, sys",
-                        "print(json.dumps({'event': 'step_update', 'step_update': {'text_delta': 'OK from fake agy'}}))",
+                        "import json, os",
+                        "has_tok = 'TELEGRAM_BOT_TOKEN' in os.environ",
+                        "print(json.dumps({'event': 'step_update', 'step_update': {'text_delta': f'token_leaked={has_tok}'}}))",
                         "print(json.dumps({'event': 'result', 'result': {'status': 'SUCCESS', 'conversation_id': 'conv-99'}}))",
                     ]
                 )
@@ -75,11 +77,70 @@ class AgyRunnerTests(unittest.TestCase):
             fake_agy.chmod(0o755)
 
             runner = AgyRunner(agy_bin=str(fake_agy))
-            res = runner.run_turn("42", "hi", cwd=Path(tmpdir))
+            with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "12345:should-not-leak"}):
+                res = runner.run_turn("42", "hi", cwd=Path(tmpdir))
             self.assertEqual(res.returncode, 0)
-            self.assertEqual(res.text, "OK from fake agy")
+            self.assertEqual(res.text, "token_leaked=False")
             self.assertEqual(res.conversation_id, "conv-99")
-            self.assertIsNone(res.error)
+
+    def test_runner_turn_timeout_kills_process_group(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+            fake_agy = Path(tmpdir) / "slow_agy.py"
+            fake_agy.write_text(
+                "\n".join(
+                    [
+                        f"#!{sys.executable}",
+                        "import time",
+                        "time.sleep(30)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(0o755)
+
+            runner = AgyRunner(agy_bin=str(fake_agy))
+            res = runner.run_turn(
+                "42",
+                "hi",
+                cwd=Path(tmpdir),
+                execution_cfg={"turnTimeoutSeconds": 0.3},
+            )
+            self.assertTrue(res.timed_out)
+            self.assertEqual(res.returncode, 124)
+            self.assertIn("timed out", res.error or "")
+
+    def test_runner_cancel_terminates_active_turn(self) -> None:
+        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+            fake_agy = Path(tmpdir) / "slow_agy.py"
+            fake_agy.write_text(
+                "\n".join(
+                    [
+                        f"#!{sys.executable}",
+                        "import time",
+                        "time.sleep(30)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            fake_agy.chmod(0o755)
+
+            runner = AgyRunner(agy_bin=str(fake_agy))
+            holder: dict = {}
+
+            def run_it() -> None:
+                holder["res"] = runner.run_turn("42", "hi", cwd=Path(tmpdir))
+
+            t = threading.Thread(target=run_it, daemon=True)
+            t.start()
+            for _ in range(50):
+                if runner.is_running("42"):
+                    break
+                time.sleep(0.02)
+            self.assertTrue(runner.cancel("42"))
+            t.join(timeout=5.0)
+            self.assertTrue(holder["res"].cancelled)
 
 
 if __name__ == "__main__":

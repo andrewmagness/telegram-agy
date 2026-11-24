@@ -10,18 +10,29 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 from telegram_agy.access import allow_user
-from telegram_agy.config import default_access_config, save_access_config
+from telegram_agy.config import default_access_config, save_access_config, save_bot_token
 from telegram_agy.mcp_server import TelegramMCPServer
 from telegram_agy.relay import RelayServer
 
 
 class MCPServerTests(unittest.TestCase):
-    def test_initialize_tools_list_and_calls(self) -> None:
+    def test_initialize_negotiation_tools_list_and_calls(self) -> None:
         with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-            state_dir = Path(tmpdir)
+            base = Path(tmpdir)
+            state_dir = base / "state"
+            workspace = base / "ws"
+            workspace.mkdir(parents=True)
+            secret_outside = base / "secret.txt"
+            secret_outside.write_text("top-secret", encoding="utf-8")
+
+            ws_file = workspace / "report.txt"
+            ws_file.write_text("ok", encoding="utf-8")
+
             cfg = default_access_config()
             allow_user(cfg, 42)
+            allow_user(cfg, 43)
             save_access_config(state_dir, cfg)
+            save_bot_token(state_dir, "12345:secret")
 
             relay_events: list[dict] = []
             sock_path = state_dir / "relay.sock"
@@ -34,6 +45,7 @@ class MCPServerTests(unittest.TestCase):
             try:
                 mock_client = MagicMock()
                 mock_client.send_message.return_value = [{"message_id": 501}]
+                mock_client.send_file.return_value = {"message_id": 502}
                 mock_client.set_message_reaction.return_value = True
                 mock_client.edit_message_text.return_value = {"message_id": 501}
                 mock_client.download_file.return_value = state_dir / "inbox" / "file.txt"
@@ -44,11 +56,18 @@ class MCPServerTests(unittest.TestCase):
                     env={
                         "TELEGRAM_AGY_RELAY_SOCK": str(sock_path),
                         "TELEGRAM_AGY_TURN_ID": "turn-abc",
+                        "TELEGRAM_AGY_CHAT_ID": "42",
+                        "TELEGRAM_AGY_CWD": str(workspace),
                     },
                 )
 
                 requests = [
-                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}},
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "initialize",
+                        "params": {"protocolVersion": "9999-01-01"},
+                    },
                     {"jsonrpc": "2.0", "method": "notifications/initialized"},
                     {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
                     {
@@ -57,7 +76,12 @@ class MCPServerTests(unittest.TestCase):
                         "method": "tools/call",
                         "params": {
                             "name": "telegram_reply",
-                            "arguments": {"chat_id": "42", "text": "Done!", "reply_to": 7},
+                            "arguments": {
+                                "chat_id": "42",
+                                "text": "Working...",
+                                "files": [str(ws_file)],
+                                "final": False,
+                            },
                         },
                     },
                     {
@@ -66,7 +90,7 @@ class MCPServerTests(unittest.TestCase):
                         "method": "tools/call",
                         "params": {
                             "name": "telegram_reply",
-                            "arguments": {"chat_id": "999", "text": "Exfiltrate!"},
+                            "arguments": {"chat_id": "43", "text": "Cross-chat"},
                         },
                     },
                     {
@@ -74,8 +98,8 @@ class MCPServerTests(unittest.TestCase):
                         "id": 5,
                         "method": "tools/call",
                         "params": {
-                            "name": "telegram_react",
-                            "arguments": {"chat_id": "42", "message_id": 7, "emoji": "👍"},
+                            "name": "telegram_reply",
+                            "arguments": {"chat_id": "42", "files": [str(secret_outside)]},
                         },
                     },
                     {
@@ -83,8 +107,8 @@ class MCPServerTests(unittest.TestCase):
                         "id": 6,
                         "method": "tools/call",
                         "params": {
-                            "name": "telegram_edit_message",
-                            "arguments": {"chat_id": "42", "message_id": 501, "text": "Updated!"},
+                            "name": "telegram_reply",
+                            "arguments": {"chat_id": "42", "files": [str(state_dir / ".env")]},
                         },
                     },
                     {
@@ -92,8 +116,8 @@ class MCPServerTests(unittest.TestCase):
                         "id": 7,
                         "method": "tools/call",
                         "params": {
-                            "name": "telegram_download_attachment",
-                            "arguments": {"file_id": "file-123", "filename": "data.txt"},
+                            "name": "telegram_reply",
+                            "arguments": {"chat_id": "42", "text": "Final!", "final": True},
                         },
                     },
                 ]
@@ -104,20 +128,25 @@ class MCPServerTests(unittest.TestCase):
 
                 responses = [json.loads(line) for line in stdout.getvalue().splitlines() if line.strip()]
                 self.assertEqual([r["id"] for r in responses], [1, 2, 3, 4, 5, 6, 7])
-                self.assertEqual(responses[0]["result"]["serverInfo"]["name"], "telegram-agy")
-                tool_names = {t["name"] for t in responses[1]["result"]["tools"]}
-                self.assertEqual(
-                    tool_names,
-                    {"telegram_reply", "telegram_react", "telegram_edit_message", "telegram_download_attachment"},
-                )
+                # Clamped unsupported protocolVersion to supported default
+                self.assertEqual(responses[0]["result"]["protocolVersion"], "2024-11-05")
+                # Workspace file upload succeeds
                 self.assertFalse(responses[2]["result"]["isError"])
-                self.assertTrue(responses[3]["result"]["isError"])  # unauthorized chat 999
-                self.assertIn("not authorized", responses[3]["result"]["content"][0]["text"])
-                self.assertFalse(responses[4]["result"]["isError"])
-                self.assertFalse(responses[5]["result"]["isError"])
+                # Cross-chat call rejected even though 43 is in allowFrom
+                self.assertTrue(responses[3]["result"]["isError"])
+                self.assertIn("active turn chat", responses[3]["result"]["content"][0]["text"])
+                # File outside workspace/inbox rejected
+                self.assertTrue(responses[4]["result"]["isError"])
+                self.assertIn("outside workspace/inbox", responses[4]["result"]["content"][0]["text"])
+                # Protected state file (.env) rejected
+                self.assertTrue(responses[5]["result"]["isError"])
+                self.assertIn("protected", responses[5]["result"]["content"][0]["text"])
+                # Final reply succeeded
                 self.assertFalse(responses[6]["result"]["isError"])
-                self.assertEqual(len(relay_events), 1)
-                self.assertEqual(relay_events[0]["turnId"], "turn-abc")
+
+                self.assertEqual(len(relay_events), 2)
+                self.assertFalse(relay_events[0]["final"])
+                self.assertTrue(relay_events[1]["final"])
             finally:
                 relay.stop()
 

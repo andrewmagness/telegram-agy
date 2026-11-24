@@ -10,6 +10,8 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+_UMASK_LOCK = threading.Lock()
+
 
 class RelayServer:
     """Threaded AF_UNIX line-delimited JSON server used by the bridge daemon."""
@@ -33,7 +35,12 @@ class RelayServer:
         if self.socket_path.exists():
             self.socket_path.unlink()
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(str(self.socket_path))
+        with _UMASK_LOCK:
+            old_umask = os.umask(0o177)
+            try:
+                sock.bind(str(self.socket_path))
+            finally:
+                os.umask(old_umask)
         os.chmod(self.socket_path, 0o600)
         sock.listen(32)
         sock.settimeout(0.5)
