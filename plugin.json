@@ -1,7 +1,7 @@
 {
   "name": "telegram-agy",
   "displayName": "Telegram Channel for Antigravity",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Link a Telegram bot to Antigravity CLI (agy) for remote local execution with pairing security, MCP chat tools, and inline Approve/Deny permission prompts.",
   "homepage": "https://github.com/andrewmagness/telegram-agy",
   "repository": "https://github.com/andrewmagness/telegram-agy",

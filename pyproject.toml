@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "telegram-agy"
-version = "0.1.3"
+version = "0.1.4"
 description = "Telegram channel bridge, MCP server, permission relay, and Antigravity CLI (agy) plugin"
 readme = "README.md"
 license = { text = "MIT" }
