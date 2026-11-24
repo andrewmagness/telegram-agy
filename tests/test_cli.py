@@ -101,7 +101,7 @@ class CliTests(unittest.TestCase):
                 rc = main(["--state-dir", str(state_dir), "systemd", "--cwd", str(ws)])
             self.assertEqual(rc, 0)
             unit = buf.getvalue()
-            self.assertIn(f'WorkingDirectory="{ws.resolve()}"', unit)
+            self.assertIn(f"WorkingDirectory={ws.resolve()}\n", unit)
             self.assertIn(f'--cwd "{ws.resolve()}"', unit)
             self.assertIn('Environment="PATH=', unit)
             self.assertIn(str(Path.home() / ".local" / "bin"), unit)

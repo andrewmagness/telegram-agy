@@ -508,7 +508,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory={q_cwd}
+WorkingDirectory={cwd.replace("%", "%%")}
 Environment={_systemd_quote(f'PATH={service_path}')}
 Environment={_systemd_quote(f'PYTHONPATH={src_dir}')}
 Environment={_systemd_quote(f'TELEGRAM_AGY_STATE_DIR={state_dir}')}
