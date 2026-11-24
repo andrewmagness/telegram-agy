@@ -1,0 +1,65 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify tag matches package and plugin versions
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          ref_name = os.environ["GITHUB_REF_NAME"]
+          tag_version = ref_name.removeprefix("v")
+          plugin_ver = json.loads(Path("plugin.json").read_text(encoding="utf-8"))["version"]
+          py_ver = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          init_text = Path("src/telegram_agy/__init__.py").read_text(encoding="utf-8")
+          init_ver = re.search(r'__version__\s*=\s*"([^"]+)"', init_text).group(1)
+
+          assert tag_version == plugin_ver == py_ver == init_ver, (
+              f"Version mismatch: tag={tag_version}, plugin={plugin_ver}, pyproject={py_ver}, init={init_ver}"
+          )
+          print(f"Verified release version: {tag_version}")
+          PY
+
+      - name: Run full test suite
+        env:
+          PYTHONPATH: src
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Build plugin zip archive
+        run: |
+          zip -r "telegram-agy-${GITHUB_REF_NAME}.zip" \
+            plugin.json mcp_config.json hooks.json pyproject.toml README.md LICENSE \
+            assets rules skills scripts src \
+            -x "*/__pycache__/*" "*.pyc"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" "telegram-agy-${GITHUB_REF_NAME}.zip" \
+            --title "telegram-agy ${GITHUB_REF_NAME}" \
+            --generate-notes

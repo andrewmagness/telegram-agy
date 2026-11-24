@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Compile Python sources
+        run: python3 -m compileall -q src tests scripts
+
+      - name: Run unit and integration tests
+        env:
+          PYTHONPATH: src
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Install package and verify CLI entrypoint
+        run: |
+          python3 -m pip install --no-deps .
+          telegram-agy --help > /dev/null
+
+      - name: Smoke test MCP server and PreToolUse hook
+        run: |
+          python3 - <<'PY'
+          import json
+          import subprocess
+
+          mcp_in = (
+              json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}}) + "\n"
+              + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}) + "\n"
+          )
+          p_mcp = subprocess.run(["python3", "scripts/run_mcp.py"], input=mcp_in, text=True, capture_output=True, check=True)
+          resps = [json.loads(line) for line in p_mcp.stdout.splitlines() if line.strip()]
+          assert len(resps) == 2, f"Expected 2 responses, got {resps}"
+          tools = {t["name"] for t in resps[1]["result"]["tools"]}
+          expected = {"telegram_reply", "telegram_react", "telegram_edit_message", "telegram_download_attachment"}
+          assert tools == expected, f"Unexpected tools: {tools}"
+
+          hook_in = json.dumps({"toolCall": {"name": "run_command", "args": {"CommandLine": "ls"}}}) + "\n"
+          p_hook = subprocess.run(["./scripts/permission-hook.sh"], input=hook_in, text=True, capture_output=True, check=True)
+          decision = json.loads(p_hook.stdout.strip())
+          assert decision == {"decision": "allow"}, f"Unexpected hook output: {decision}"
+          PY
+
+  plugin-checks:
+    name: Plugin Manifest & Layout Checks
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate plugin manifests, skills, versions, and script permissions
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          allowed_keys = {
+              "name", "displayName", "version", "description", "logo",
+              "suggestedPrompts", "author", "homepage", "repository", "disabled",
+          }
+          plugin = json.loads(Path("plugin.json").read_text(encoding="utf-8"))
+          unknown = set(plugin) - allowed_keys
+          assert not unknown, f"Unsupported keys in plugin.json: {unknown}"
+          assert plugin.get("name") == "telegram-agy"
+
+          logo = plugin.get("logo")
+          assert logo and Path(logo).is_file(), f"Missing logo file: {logo}"
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          init_text = Path("src/telegram_agy/__init__.py").read_text(encoding="utf-8")
+          m = re.search(r'__version__\s*=\s*"([^"]+)"', init_text)
+          assert m, "__version__ not found in __init__.py"
+          assert plugin["version"] == pyproject["project"]["version"] == m.group(1), (
+              f"Version mismatch: plugin={plugin['version']} pyproject={pyproject['project']['version']} init={m.group(1)}"
+          )
+
+          mcp_cfg = json.loads(Path("mcp_config.json").read_text(encoding="utf-8"))
+          assert "telegram-agy" in mcp_cfg.get("mcpServers", {}), "Missing telegram-agy MCP server"
+
+          hooks_cfg = json.loads(Path("hooks.json").read_text(encoding="utf-8"))
+          assert "telegram-permission-relay" in hooks_cfg, "Missing telegram-permission-relay hook"
+
+          assert Path("rules/AGENTS.md").is_file(), "Missing rules/AGENTS.md"
+
+          skills = sorted(Path("skills").glob("*/SKILL.md"))
+          assert len(skills) >= 3, f"Expected >= 3 skills, found {skills}"
+          for skill_md in skills:
+              text = skill_md.read_text(encoding="utf-8")
+              assert text.startswith("---\n"), f"{skill_md} missing YAML frontmatter"
+              fm = text.split("---\n", 2)[1]
+              assert "name:" in fm and "description:" in fm, f"{skill_md} missing name/description"
+
+          for script in ("scripts/run_mcp.py", "scripts/run-mcp.sh", "scripts/permission-hook.sh"):
+              p = Path(script)
+              assert p.is_file() and os.access(p, os.X_OK), f"Script missing or not executable: {script}"
+
+          print("All plugin checks passed for version", plugin["version"])
+          PY
