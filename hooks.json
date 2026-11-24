@@ -1,0 +1,16 @@
+{
+  "telegram-permission-relay": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "./scripts/permission-hook.sh",
+            "timeout": 130
+          }
+        ]
+      }
+    ]
+  }
+}

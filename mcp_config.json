@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "telegram-agy": {
+      "command": "./scripts/run-mcp.sh",
+      "args": []
+    }
+  }
+}

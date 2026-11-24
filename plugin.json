@@ -1,0 +1,12 @@
+{
+  "name": "telegram-agy",
+  "displayName": "Telegram Channel for Antigravity",
+  "version": "0.1.0",
+  "description": "Link a Telegram bot to Antigravity CLI (agy) for remote local execution with pairing security, MCP chat tools, and inline Approve/Deny permission prompts.",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Configure my Telegram bot token with telegram-configure",
+    "Pair my Telegram user or manage allowlists with telegram-access",
+    "Start and check status of the Telegram bridge with telegram-bridge"
+  ]
+}
