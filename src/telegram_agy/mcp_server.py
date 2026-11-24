@@ -204,13 +204,22 @@ class TelegramMCPServer:
 
             sent_ids: list[int] = []
             if text:
-                msgs = client.send_message(
-                    chat_id,
-                    text,
-                    reply_to_message_id=int(reply_to) if reply_to is not None else None,
-                    message_thread_id=int(thread_id) if thread_id is not None else None,
-                    parse_mode=str(parse_mode) if parse_mode else None,
-                )
+                if not parse_mode:
+                    msgs = client.send_markdown(
+                        chat_id,
+                        text,
+                        reply_to_message_id=int(reply_to) if reply_to is not None else None,
+                        message_thread_id=int(thread_id) if thread_id is not None else None,
+                    )
+                else:
+                    resolved_mode = None if str(parse_mode).lower() == "plain" else str(parse_mode)
+                    msgs = client.send_message(
+                        chat_id,
+                        text,
+                        reply_to_message_id=int(reply_to) if reply_to is not None else None,
+                        message_thread_id=int(thread_id) if thread_id is not None else None,
+                        parse_mode=resolved_mode,
+                    )
                 sent_ids.extend(
                     int(m["message_id"]) for m in msgs if isinstance(m, dict) and "message_id" in m
                 )
@@ -248,12 +257,16 @@ class TelegramMCPServer:
             message_id = int(arguments["message_id"])
             text = str(arguments["text"])
             parse_mode = arguments.get("parse_mode")
-            client.edit_message_text(
-                chat_id,
-                message_id,
-                text,
-                parse_mode=str(parse_mode) if parse_mode else None,
-            )
+            if not parse_mode:
+                client.edit_markdown_text(chat_id, message_id, text)
+            else:
+                resolved_mode = None if str(parse_mode).lower() == "plain" else str(parse_mode)
+                client.edit_message_text(
+                    chat_id,
+                    message_id,
+                    text,
+                    parse_mode=resolved_mode,
+                )
             return {
                 "content": [{"type": "text", "text": f"Edited message {message_id}."}],
                 "isError": False,

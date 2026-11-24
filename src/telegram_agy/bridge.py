@@ -753,7 +753,7 @@ class TelegramBridge:
 
         reply_to = int(message_id) if (message_id is not None and reply_to_mode == "reply") else None
         try:
-            self.client.send_message(
+            self.client.send_markdown(
                 chat_id,
                 reply_body,
                 reply_to_message_id=reply_to,

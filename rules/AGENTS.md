@@ -21,6 +21,7 @@ When the user replied to an earlier message, that quoted snippet appears inside 
    - Use `telegram_edit_message` to update an earlier bot status message in place.
    - Use `telegram_download_attachment` if you receive a raw Telegram `file_id` that was not already saved in `~/.gemini/channels/telegram/inbox/`.
 3. **Formatting for Telegram:**
+   - Standard Markdown (`**bold**`, `*italic*`, `` `code` ``, fenced code blocks, lists, links, blockquotes, and tables) is automatically converted to rich Telegram HTML by the bridge—write clean Markdown naturally.
    - Keep replies concise, structured, and easy to read on a mobile screen.
    - Avoid huge file dumps; summarize changes and share file paths or send workspace files with `telegram_reply` (`files: [...]`).
 4. **Permissions:**

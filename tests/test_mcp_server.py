@@ -45,9 +45,11 @@ class MCPServerTests(unittest.TestCase):
             try:
                 mock_client = MagicMock()
                 mock_client.send_message.return_value = [{"message_id": 501}]
+                mock_client.send_markdown.return_value = [{"message_id": 501}]
                 mock_client.send_file.return_value = {"message_id": 502}
                 mock_client.set_message_reaction.return_value = True
                 mock_client.edit_message_text.return_value = {"message_id": 501}
+                mock_client.edit_markdown_text.return_value = {"message_id": 501}
                 mock_client.download_file.return_value = state_dir / "inbox" / "file.txt"
 
                 server = TelegramMCPServer(

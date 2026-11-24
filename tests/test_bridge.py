@@ -83,8 +83,8 @@ class BridgeTests(unittest.TestCase):
             bridge.handle_message({**dm, "message_id": 2, "text": "run unit tests"}, async_turn=False)
             runner.run_turn.assert_called_once()
             self.assertIn("run unit tests", runner.run_turn.call_args.args[1])
-            client.send_message.assert_called_once()
-            self.assertEqual(client.send_message.call_args.args[1], "Tests pass!")
+            client.send_markdown.assert_called_once()
+            self.assertEqual(client.send_markdown.call_args.args[1], "Tests pass!")
 
             sessions = load_sessions(state_dir)
             self.assertEqual(sessions["42"]["conversationId"], "conv-abc")
@@ -118,8 +118,8 @@ class BridgeTests(unittest.TestCase):
 
                 runner.run_turn.side_effect = run_with_status
                 bridge.handle_message(dm, async_turn=False)
-                client.send_message.assert_called_once()
-                self.assertEqual(client.send_message.call_args.args[1], "Final answer!")
+                client.send_markdown.assert_called_once()
+                self.assertEqual(client.send_markdown.call_args.args[1], "Final answer!")
 
                 # final=True DOES suppress duplicate trailing text
                 client.reset_mock()
@@ -133,7 +133,7 @@ class BridgeTests(unittest.TestCase):
 
                 runner.run_turn.side_effect = run_with_final
                 bridge.handle_message({**dm, "message_id": 6}, async_turn=False)
-                client.send_message.assert_not_called()
+                client.send_markdown.assert_not_called()
             finally:
                 bridge.relay.stop()
 
@@ -265,7 +265,7 @@ class BridgeTests(unittest.TestCase):
             t2 = threading.Thread(target=ask_big, daemon=True)
             t2.start()
             for _ in range(50):
-                if "reqbig" in bridge._pending_approvals:
+                if "reqbig" in bridge._pending_approvals and client.send_message.called:
                     break
                 threading.Event().wait(0.02)
 

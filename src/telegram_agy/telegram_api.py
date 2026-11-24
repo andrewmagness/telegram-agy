@@ -13,11 +13,16 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .formatting import (
+    MAX_TEXT_CHUNK,
+    chunk_markdown_for_telegram_html,
+    chunk_text,
+    markdown_to_telegram_html,
+)
+
 TELEGRAM_API_BASE = "https://api.telegram.org"
-MAX_TEXT_CHUNK = 4096
 MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
-_FENCE_RE = re.compile(r"^```([A-Za-z0-9_+-]*)\s*$")
 _UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -38,65 +43,6 @@ def sanitize_filename(name: str, fallback: str = "attachment.bin") -> str:
     if not cleaned:
         return fallback
     return cleaned[:120]
-
-
-def chunk_text(text: str, limit: int = MAX_TEXT_CHUNK) -> list[str]:
-    """Split *text* into <= *limit*-char chunks, keeping fenced code blocks valid."""
-    if not text:
-        return [""]
-    if limit < 64:
-        limit = 64
-    if len(text) <= limit:
-        return [text]
-
-    chunks: list[str] = []
-    remaining = text
-    open_fence_lang: str | None = None
-
-    while remaining:
-        prefix = f"```{open_fence_lang}\n" if open_fence_lang is not None else ""
-        # Reserve room for a closing fence if we're inside or might leave an open fence.
-        reserve_close = 4  # "\n```"
-        effective_limit = max(32, limit - len(prefix) - reserve_close)
-
-        if len(remaining) <= effective_limit:
-            piece = prefix + remaining
-            chunks.append(piece)
-            break
-
-        window = remaining[:effective_limit]
-        split_at = -1
-        for sep in ("\n\n", "\n", " "):
-            idx = window.rfind(sep)
-            if idx > effective_limit // 4:
-                split_at = idx + len(sep)
-                break
-        if split_at <= 0:
-            split_at = effective_limit
-
-        raw_piece = remaining[:split_at]
-        remaining = remaining[split_at:]
-
-        # Track fenced code blocks across this piece.
-        state = open_fence_lang
-        for line in raw_piece.splitlines():
-            stripped = line.rstrip()
-            if stripped.startswith("```"):
-                if state is None:
-                    match = _FENCE_RE.match(stripped)
-                    state = match.group(1) if match else ""
-                else:
-                    state = None
-
-        piece = prefix + raw_piece
-        if state is not None:
-            if not piece.endswith("\n"):
-                piece += "\n"
-            piece += "```"
-        chunks.append(piece.rstrip("\n") if state is None else piece)
-        open_fence_lang = state
-
-    return [c for c in chunks if c]
 
 
 class TelegramClient:
@@ -271,6 +217,46 @@ class TelegramClient:
             sent.append(res)
         return sent
 
+    def send_markdown(
+        self,
+        chat_id: int | str,
+        text: str,
+        *,
+        reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+        reply_markup: dict[str, Any] | None = None,
+        chunk_limit: int = MAX_TEXT_CHUNK,
+    ) -> list[dict[str, Any]]:
+        """Convert Markdown to Telegram HTML and send, falling back to plain text on HTTP 400."""
+        pairs = chunk_markdown_for_telegram_html(text, limit=chunk_limit)
+        sent: list[dict[str, Any]] = []
+        for idx, (html_chunk, plain_chunk) in enumerate(pairs):
+            use_html = bool(html_chunk) and len(html_chunk) <= chunk_limit
+            payload: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": html_chunk if use_html else plain_chunk[:chunk_limit],
+            }
+            if use_html:
+                payload["parse_mode"] = "HTML"
+            if idx == 0 and reply_to_message_id is not None:
+                payload["reply_to_message_id"] = reply_to_message_id
+            if message_thread_id is not None:
+                payload["message_thread_id"] = message_thread_id
+            if idx == len(pairs) - 1 and reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+
+            try:
+                res = self.call("sendMessage", payload)
+            except TelegramAPIError as exc:
+                if exc.status == 400 and "parse_mode" in payload:
+                    payload.pop("parse_mode", None)
+                    payload["text"] = plain_chunk[:chunk_limit]
+                    res = self.call("sendMessage", payload)
+                else:
+                    raise
+            sent.append(res)
+        return sent
+
     def edit_message_text(
         self,
         chat_id: int | str,
@@ -296,6 +282,38 @@ class TelegramClient:
                 payload.pop("parse_mode", None)
                 return self.call("editMessageText", payload)
             raise
+
+    def edit_markdown_text(
+        self,
+        chat_id: int | str,
+        message_id: int,
+        text: str,
+        *,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Convert Markdown to Telegram HTML and edit message, falling back to plain text."""
+        html_text = markdown_to_telegram_html(text)
+        if html_text and len(html_text) <= MAX_TEXT_CHUNK:
+            payload: dict[str, Any] = {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": html_text,
+                "parse_mode": "HTML",
+            }
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+            try:
+                return self.call("editMessageText", payload)
+            except TelegramAPIError as exc:
+                if exc.status != 400:
+                    raise
+        return self.edit_message_text(
+            chat_id,
+            message_id,
+            text,
+            parse_mode=None,
+            reply_markup=reply_markup,
+        )
 
     def set_message_reaction(
         self,
